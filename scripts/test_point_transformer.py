@@ -104,6 +104,7 @@ def select_preset(model_size):
     		"matched": dict(enc_dims=[12, 16], enc_layers=[1, 1], enc_heads=[4, 4], enc_strides=[2, 2], enc_patch_sizes=[25, 25], cpe_k=8, use_rpe=False),
     		"medium": dict(enc_dims=[12, 24, 32], enc_layers=[1, 1, 1], enc_heads=[4, 4, 4], enc_strides=[2, 2], enc_patch_sizes=[25, 25, 25], cpe_k=8, use_rpe=False),
     		"large":  dict(enc_dims=[16, 24, 32], enc_layers=[1, 1, 1], enc_heads=[4, 4, 4], enc_strides=[2, 2], enc_patch_sizes=[25, 25, 25], cpe_k=8, use_rpe=False),
+			"matched_deep": dict(enc_dims=[12, 16], enc_layers=[2, 2], enc_heads=[4, 4], enc_strides=[2], enc_patch_sizes=[25, 25], cpe_k=8, use_rpe=False)
     	}
 	return presets[model_size]
 
@@ -115,7 +116,7 @@ def main():
 	parser.add_argument("--save_dir", required=True)
 	parser.add_argument("--sort_by", choices=["pt","eta","phi","delta_R","kt"], default="pt")
 	parser.add_argument("--batch_size", type=int, default=4096)
-	parser.add_argument("--model_size", choices=["small", "matched", "medium", "large"], default="small")
+	parser.add_argument("--model_size", choices=["small", "matched", "medium", "large", "matched_deep"], default="small")
 	parser.add_argument("--disable_pool", action="store_true", help="Disable GeometricPooling between stages")
 	parser.add_argument("--use_rpe", action="store_true", help="Enable RPE regardless of preset")
 	parser.add_argument("--grid_size", type=float, default=0.2, help="GeometricCPE grid size (coarser -> smaller grid)")
