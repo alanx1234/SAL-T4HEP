@@ -139,6 +139,16 @@ def main():
 	parser.add_argument("--disable_cpe", action="store_true", help="Disable CPE in JEDI hybrid")
 	parser.add_argument("--cpe_type", choices=["original", "sinusoidal", "pairwise", "depthwise", "quantized"], default="original",
 		help="Type of CPE to use: original (scatter/gather), sinusoidal (fastest), pairwise (k-NN), depthwise (1D conv), quantized (fixed grid)")
+	parser.add_argument("--use_flash_attention", action="store_true")
+	
+	parser.add_argument("--patch_tokenizer_mode",
+	    choices=["mean","max","flatten_dense","learned_pool"], default="mean")
+	
+	parser.add_argument("--message_proj", dest="message_proj", action="store_true", default=True)
+	parser.add_argument("--no_message_proj", dest="message_proj", action="store_false")
+	
+	parser.add_argument("--message_gated", dest="message_gated", action="store_true", default=False)
+	parser.add_argument("--no_message_gated", dest="message_gated", action="store_false")
 	args = parser.parse_args()
 
 	# Logging
@@ -217,6 +227,9 @@ def main():
 				enc_dims=enc_dims,
 				enc_layers=enc_layers,
 				enc_strides=enc_strides,
+				enc_heads=enc_heads,
+				enc_patch_sizes=enc_patch_sizes,
+				use_rpe=use_rpe,
 				cpe_k=cpe_k,
 				grid_size=args.grid_size,
 				use_pool=(not args.disable_pool),
@@ -225,6 +238,10 @@ def main():
 				dropout=0.0,
 				aggregation=args.aggregation,
 				ffn_activation=args.ffn_activation,
+			    patch_tokenizer_mode=args.patch_tokenizer_mode,
+			    message_proj=args.message_proj,
+			    message_gated=args.message_gated,
+			    use_flash_attention=args.use_flash_attention
 			)
 	model.summary(print_fn=lambda s: logging.info(s))
 	logging.info("Preset: %s", args.model_size)
