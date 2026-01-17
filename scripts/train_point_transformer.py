@@ -284,12 +284,17 @@ def parse_args():
 		p.add_argument("--aggregation", choices=["mean", "max"], default="max")
 		p.add_argument("--model_size", choices=["small", "small_2layer_no_downsamp", "small_2layer_2_downsamp", "matched", "medium", "large"], default="small")
 		p.add_argument('--use_serialized_model', action='store_true', help='Use the serialized version of the PointTransformer model')
-		p.add_argument('--serialize_by', choices=['morton','pt','kt'], default='morton', help='Serialization strategy when using the serialized model')
+		p.add_argument('--serialize_by', choices=['morton','pt','kt'], default='morton', help='Serialization  strategy when using the serialized model')
 		p.add_argument('--use_jedi_hybrid', action='store_true', help='Use JEDI-PTv3 Hybrid (O(N) global interaction instead of attention)')
 		p.add_argument('--disable_cpe', action='store_true', help='Disable CPE in JEDI hybrid (for pure JEDI-style permutation invariance)')
 		p.add_argument("--ffn_activation", choices=["relu", "gelu", "swish", "silu", "tanh"], default="gelu", help="Activation function for feed-forward network (relu is fastest, gelu is default)")
 		p.add_argument("--jit_compile", action="store_true", help="Enable XLA JIT compilation for faster training (5-15%% speedup on modern GPUs)")
 		p.add_argument("--use_flash_attention", action="store_true", help="Enable Flash Attention for faster and more memory-efficient attention (requires TensorFlow 2.11+ and compatible GPU)")
+		p.add_argument("--patch_tokenizer_mode", choices=["mean","max","flatten_dense","learned_pool"], default="mean")
+		p.add_argument("--message_proj", dest="message_proj", action="store_true", default=True)
+		p.add_argument("--no_message_proj", dest="message_proj", action="store_false")
+		p.add_argument("--message_gated", dest="message_gated", action="store_true", default=False)
+		p.add_argument("--no_message_gated", dest="message_gated", action="store_false")
 		return p.parse_args()
 
 
@@ -442,6 +447,9 @@ def main():
 				aggregation=args.aggregation,
 				ffn_activation=args.ffn_activation,
 				use_flash_attention=args.use_flash_attention,
+				patch_tokenizer_mode=args.patch_tokenizer_mode,
+			    message_proj=args.message_proj,
+			    message_gated=args.message_gated,
 			)
 		model.compile(
 				optimizer=tf.keras.optimizers.Adam(),
