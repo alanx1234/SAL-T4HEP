@@ -234,7 +234,6 @@ def main():
 				grid_size=args.grid_size,
 				use_pool=(not args.disable_pool),
 				use_cpe=(not args.disable_cpe),
-				cpe_type=args.cpe_type,
 				dropout=0.0,
 				aggregation=args.aggregation,
 				ffn_activation=args.ffn_activation,
