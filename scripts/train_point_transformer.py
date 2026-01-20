@@ -295,6 +295,21 @@ def parse_args():
 		p.add_argument("--no_message_proj", dest="message_proj", action="store_false")
 		p.add_argument("--message_gated", dest="message_gated", action="store_true", default=False)
 		p.add_argument("--no_message_gated", dest="message_gated", action="store_false")
+
+		g = p.add_mutually_exclusive_group()
+		g.add_argument(
+		    "--use_patch_messages",
+		    dest="use_patch_messages",
+		    action="store_true",
+		    default=True,
+		    help="Enable patch-message pathway (default: on)"
+		)
+		g.add_argument(
+		    "--no_use_patch_messages",
+		    dest="use_patch_messages",
+		    action="store_false",
+		    help="Disable patch-message pathway (patch tokenizer/proj/gate become irrelevant)"
+		)
 		return p.parse_args()
 
 
@@ -447,6 +462,7 @@ def main():
 				aggregation=args.aggregation,
 				ffn_activation=args.ffn_activation,
 				use_flash_attention=args.use_flash_attention,
+				use_patch_messages=args.use_patch_messages,
 				patch_tokenizer_mode=args.patch_tokenizer_mode,
 			    message_proj=args.message_proj,
 			    message_gated=args.message_gated,
