@@ -97,7 +97,7 @@ def _morton_sort_indices_np(eta: np.ndarray, phi: np.ndarray, grid_size: float, 
 # ---------------------------
 # Sorting helper
 # ---------------------------
-def apply_sorting(x, sort_by, grid_size= 0.2):
+def apply_sorting(x, sort_by, grid_size= 0.05):
 		if sort_by == "pt":
 				key = x[:, :, 0]
 		elif sort_by == "eta":
