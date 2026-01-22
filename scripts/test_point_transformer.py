@@ -57,8 +57,30 @@ def get_flops(model):
 	logging.info("FLOPs calculation done: %d FLOPs", flops)
 	return flops
 
+def _morton_interleave_bits_np(x: np.ndarray, y: np.ndarray, bits: int = 30) -> np.ndarray:
+    x = x.astype(np.uint64)
+    y = y.astype(np.uint64)
+    z = np.zeros_like(x, dtype=np.uint64)
+    for i in range(bits):
+        z |= ((x >> i) & 1) << (2 * i)
+        z |= ((y >> i) & 1) << (2 * i + 1)
+    return z
 
-def apply_sorting(x, sort_by):
+
+def _morton_sort_indices_np(eta: np.ndarray, phi: np.ndarray, grid_size: float, bits: int = 30) -> np.ndarray:
+    eta_min = np.min(eta, axis=1, keepdims=True)
+    phi_min = np.min(phi, axis=1, keepdims=True)
+
+    grid_eta = np.floor((eta - eta_min) / grid_size).astype(np.int64)
+    grid_phi = np.floor((phi - phi_min) / grid_size).astype(np.int64)
+
+    grid_eta = np.clip(grid_eta, 0, None).astype(np.uint64)
+    grid_phi = np.clip(grid_phi, 0, None).astype(np.uint64)
+
+    morton = _morton_interleave_bits_np(grid_eta, grid_phi, bits=bits)  # [B,N]
+    return np.argsort(morton, axis=1)  # ascending
+
+def apply_sorting(x, sort_by, grid_size = 0.2):
 	logging.info("Starting sorting by '%s'", sort_by)
 	if sort_by == "pt":
 		key = x[:, :, 0]
@@ -70,6 +92,12 @@ def apply_sorting(x, sort_by):
 		key = np.sqrt(x[:, :, 1] ** 2 + x[:, :, 2] ** 2)
 	elif sort_by == "kt":
 		key = x[:, :, 0] * np.sqrt(x[:, :, 1] ** 2 + x[:, :, 2] ** 2)
+	elif sort_by == "morton":
+		eta = x[:, :, 1]
+		phi = x[:, :, 2]
+		idx = _morton_sort_indices_np(eta, phi, grid_size=grid_size)  # ascending
+		return np.take_along_axis(x, idx[:, :, None], axis=1)
+
 	else:
 		return x
 	idx = np.argsort(key, axis=1)[:, ::-1]
@@ -115,12 +143,18 @@ def main():
 	parser.add_argument("--dataset", choices=["hls4ml","top","jetclass","QG"], required=True)
 	parser.add_argument("--data_dir", required=True)
 	parser.add_argument("--save_dir", required=True)
-	parser.add_argument("--sort_by", choices=["pt","eta","phi","delta_R","kt"], default="pt")
+	parser.add_argument("--sort_by", choices=["pt","eta","phi","delta_R","kt", "morton"], default="pt")
 	parser.add_argument("--batch_size", type=int, default=4096)
 	parser.add_argument("--model_size", choices=["small", "small_2layer_no_downsamp", "small_2layer_2_downsamp", "matched", "medium", "large"], default="small")
 	parser.add_argument("--disable_pool", action="store_true", help="Disable GeometricPooling between stages")
 	parser.add_argument("--use_rpe", action="store_true", help="Enable RPE regardless of preset")
 	parser.add_argument("--grid_size", type=float, default=0.2, help="GeometricCPE grid size (coarser -> smaller grid)")
+	parser.add_argument(
+		"--morton_grid_size",
+		type=float,
+		default=0.05,
+		help="Grid size for morton sorting (separate from GeometricCPE grid_size)"
+	)
 	parser.add_argument("--aggregation", choices=["mean", "max"], default="max", help="Aggregation method for final pooling")
 	parser.add_argument("--weights", help="Path to weights .h5 file (defaults to save_dir/best.weights.h5)")
 	parser.add_argument(
@@ -185,7 +219,7 @@ def main():
 
 	# Load data
 	x_test, y_test = load_test_data(args.dataset, args.data_dir, num_particles)
-	x_test = apply_sorting(x_test, args.sort_by)
+	x_test = apply_sorting(x_test, args.sort_by, grid_size = args.morton_grid_size)
 
 	# Build model from preset
 	cfg = select_preset(args.model_size)
