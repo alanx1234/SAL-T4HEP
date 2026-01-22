@@ -80,7 +80,7 @@ def _morton_sort_indices_np(eta: np.ndarray, phi: np.ndarray, grid_size: float, 
     morton = _morton_interleave_bits_np(grid_eta, grid_phi, bits=bits)  # [B,N]
     return np.argsort(morton, axis=1)  # ascending
 
-def apply_sorting(x, sort_by, grid_size = 0.2):
+def apply_sorting(x, sort_by, grid_size = 0.05):
 	logging.info("Starting sorting by '%s'", sort_by)
 	if sort_by == "pt":
 		key = x[:, :, 0]
