@@ -70,12 +70,34 @@ def profile_gpu_memory_during_inference(model, input_data):
 
 		mem = tf.config.experimental.get_memory_info("GPU:0")
 		return mem["current"] / (1024**2), mem["peak"] / (1024**2)
+	
+def _morton_interleave_bits_np(x: np.ndarray, y: np.ndarray, bits: int = 30) -> np.ndarray:
+    x = x.astype(np.uint64)
+    y = y.astype(np.uint64)
+    z = np.zeros_like(x, dtype=np.uint64)
+    for i in range(bits):
+        z |= ((x >> i) & 1) << (2 * i)
+        z |= ((y >> i) & 1) << (2 * i + 1)
+    return z
 
+
+def _morton_sort_indices_np(eta: np.ndarray, phi: np.ndarray, grid_size: float, bits: int = 30) -> np.ndarray:
+    eta_min = np.min(eta, axis=1, keepdims=True)
+    phi_min = np.min(phi, axis=1, keepdims=True)
+
+    grid_eta = np.floor((eta - eta_min) / grid_size).astype(np.int64)
+    grid_phi = np.floor((phi - phi_min) / grid_size).astype(np.int64)
+
+    grid_eta = np.clip(grid_eta, 0, None).astype(np.uint64)
+    grid_phi = np.clip(grid_phi, 0, None).astype(np.uint64)
+
+    morton = _morton_interleave_bits_np(grid_eta, grid_phi, bits=bits)  # [B,N]
+    return np.argsort(morton, axis=1)  # ascending
 
 # ---------------------------
 # Sorting helper
 # ---------------------------
-def apply_sorting(x, sort_by):
+def apply_sorting(x, sort_by, grid_size= 0.2):
 		if sort_by == "pt":
 				key = x[:, :, 0]
 		elif sort_by == "eta":
@@ -86,6 +108,11 @@ def apply_sorting(x, sort_by):
 				key = np.sqrt(x[:, :, 1] ** 2 + x[:, :, 2] ** 2)
 		elif sort_by == "kt":
 				key = x[:, :, 0] * np.sqrt(x[:, :, 1] ** 2 + x[:, :, 2] ** 2)
+		elif sort_by == "morton":
+		        eta = x[:, :, 1]
+		        phi = x[:, :, 2]
+		        idx = _morton_sort_indices_np(eta, phi, grid_size=grid_size)  # ascending
+		        return np.take_along_axis(x, idx[:, :, None], axis=1)
 		else:
 				return x
 		idx = np.argsort(key, axis=1)[:, ::-1]
@@ -125,7 +152,7 @@ def choose_divisible_patch_sizes(stage_lengths, preferred=[64, 32, 16, 8, 4, 2, 
 # ---------------------------
 # Testing / Profiling
 # ---------------------------
-def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles):
+def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size):
 		logging.info("Starting testing phase...")
 
 		# load test set
@@ -147,7 +174,7 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 				x_test = x_test.transpose(0, 2, 1)
 
 		# sorting for test
-		x_test = apply_sorting(x_test, sort_by)
+		x_test = apply_sorting(x_test, sort_by, grid_size=morton_grid_size)
 		logging.info("Applied '%s' sorting to TEST set", sort_by)
 
 		# flops & macs
@@ -264,7 +291,7 @@ def parse_args():
 		)
 		p.add_argument(
 				"--sort_by",
-				choices=["pt", "eta", "phi", "delta_R", "kt", "cluster"],
+				choices=["pt", "eta", "phi", "delta_R", "kt", "morton", "cluster"],
 				default="kt",
 		)
 		p.add_argument("--batch_size", type=int, default=4096)
@@ -278,6 +305,12 @@ def parse_args():
 		p.add_argument("--enc_strides", type=int, nargs="+", default=[2, 2])
 		p.add_argument("--cpe_k", type=int, default=8)
 		p.add_argument("--grid_size", type=float, default=0.05, help="GeometricCPE grid size (coarser -> smaller grid)")
+		p.add_argument(
+		    "--morton_grid_size",
+		    type=float,
+		    default=0.05,
+		    help="Grid size for morton sorting (separate from GeometricCPE grid_size)"
+		)
 		p.add_argument("--use_rpe", action="store_true")
 		p.add_argument("--disable_pool", action="store_true", help="Disable GeometricPooling between stages")
 		p.add_argument("--dropout", type=float, default=0.0)
@@ -388,8 +421,8 @@ def main():
 		)
 
 		# apply sorting
-		x_train = apply_sorting(x_train, args.sort_by)
-		x_val = apply_sorting(x_val, args.sort_by)
+		x_train = apply_sorting(x_train, args.sort_by, grid_size=args.morton_grid_size)
+		x_val   = apply_sorting(x_val,   args.sort_by, grid_size=args.morton_grid_size)
 
 		# select preset
 		presets = {
@@ -554,6 +587,7 @@ def main():
 				args.sort_by,
 				args.batch_size,
 				num_particles,
+				morton_grid_size=args.morton_grid_size
 		)
 
 
