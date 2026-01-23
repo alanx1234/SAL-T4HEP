@@ -146,15 +146,11 @@ def main():
 	parser.add_argument("--sort_by", choices=["pt","eta","phi","delta_R","kt", "morton"], default="pt")
 	parser.add_argument("--batch_size", type=int, default=4096)
 	parser.add_argument("--model_size", choices=["small", "small_2layer_no_downsamp", "small_2layer_2_downsamp", "matched", "medium", "large"], default="small")
+	parser.add_argument("--enc_patch_sizes", type=int, nargs="+", default=None)
 	parser.add_argument("--disable_pool", action="store_true", help="Disable GeometricPooling between stages")
 	parser.add_argument("--use_rpe", action="store_true", help="Enable RPE regardless of preset")
 	parser.add_argument("--grid_size", type=float, default=0.2, help="GeometricCPE grid size (coarser -> smaller grid)")
-	parser.add_argument(
-		"--morton_grid_size",
-		type=float,
-		default=0.05,
-		help="Grid size for morton sorting (separate from GeometricCPE grid_size)"
-	)
+	parser.add_argument("--morton_grid_size", type=float, default=0.05, help="Grid size for morton sorting (separate from GeometricCPE grid_size)")
 	parser.add_argument("--aggregation", choices=["mean", "max"], default="max", help="Aggregation method for final pooling")
 	parser.add_argument("--weights", help="Path to weights .h5 file (defaults to save_dir/best.weights.h5)")
 	parser.add_argument(
@@ -227,7 +223,12 @@ def main():
 	enc_layers = cfg["enc_layers"]
 	enc_heads = cfg["enc_heads"]
 	enc_strides = cfg["enc_strides"]
-	enc_patch_sizes = cfg["enc_patch_sizes"]
+	enc_patch_sizes = cfg["enc_patch_sizes"] if args.enc_patch_sizes is None else args.enc_patch_sizes
+	n_stages = len(enc_dims)
+	if len(enc_patch_sizes) == 1 and n_stages > 1:
+		    enc_patch_sizes = enc_patch_sizes * n_stages  # broadcast single value
+	if len(enc_patch_sizes) != n_stages:
+		    raise ValueError(f"enc_patch_sizes has len {len(enc_patch_sizes)} but expected {n_stages} (stages)")
 	cpe_k = cfg["cpe_k"]
 	use_rpe = args.use_rpe or cfg["use_rpe"]
 
