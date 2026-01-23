@@ -301,16 +301,11 @@ def parse_args():
 		p.add_argument("--enc_dims", type=int, nargs="+", default=[12, 24, 32])
 		p.add_argument("--enc_layers", type=int, nargs="+", default=[1, 1, 1])
 		p.add_argument("--enc_heads", type=int, nargs="+", default=[4, 4, 4])
-		p.add_argument("--enc_patch_sizes", type=int, nargs="+", default=[2, 2, 2])
+		p.add_argument("--enc_patch_sizes", type=int, nargs="+", default=None)
 		p.add_argument("--enc_strides", type=int, nargs="+", default=[2, 2])
 		p.add_argument("--cpe_k", type=int, default=8)
 		p.add_argument("--grid_size", type=float, default=0.05, help="GeometricCPE grid size (coarser -> smaller grid)")
-		p.add_argument(
-		    "--morton_grid_size",
-		    type=float,
-		    default=0.05,
-		    help="Grid size for morton sorting (separate from GeometricCPE grid_size)"
-		)
+		p.add_argument("--morton_grid_size", type=float, default=0.05, help="Grid size for morton sorting (separate from GeometricCPE grid_size)")
 		p.add_argument("--use_rpe", action="store_true")
 		p.add_argument("--disable_pool", action="store_true", help="Disable GeometricPooling between stages")
 		p.add_argument("--dropout", type=float, default=0.0)
@@ -328,21 +323,9 @@ def parse_args():
 		p.add_argument("--no_message_proj", dest="message_proj", action="store_false")
 		p.add_argument("--message_gated", dest="message_gated", action="store_true", default=False)
 		p.add_argument("--no_message_gated", dest="message_gated", action="store_false")
-
 		g = p.add_mutually_exclusive_group()
-		g.add_argument(
-		    "--use_patch_messages",
-		    dest="use_patch_messages",
-		    action="store_true",
-		    default=True,
-		    help="Enable patch-message pathway (default: on)"
-		)
-		g.add_argument(
-		    "--no_use_patch_messages",
-		    dest="use_patch_messages",
-		    action="store_false",
-		    help="Disable patch-message pathway (patch tokenizer/proj/gate become irrelevant)"
-		)
+		g.add_argument("--use_patch_messages", dest="use_patch_messages", action="store_true", default=True, help="Enable patch-message pathway (default: on)")
+		g.add_argument("--no_use_patch_messages", dest="use_patch_messages", action="store_false", help="Disable patch-message pathway (patch tokenizer/proj/gate become irrelevant)")
 		return p.parse_args()
 
 
@@ -438,7 +421,13 @@ def main():
 		enc_layers = cfg["enc_layers"]
 		enc_heads = cfg["enc_heads"]
 		enc_strides = cfg["enc_strides"]
-		enc_patch_sizes = cfg["enc_patch_sizes"]
+		enc_patch_sizes = cfg["enc_patch_sizes"] if args.enc_patch_sizes is None else args.enc_patch_sizes
+		n_stages = len(enc_dims)
+		if len(enc_patch_sizes) == 1 and n_stages > 1:
+		    enc_patch_sizes = enc_patch_sizes * n_stages  # broadcast single value
+		if len(enc_patch_sizes) != n_stages:
+		    raise ValueError(f"enc_patch_sizes has len {len(enc_patch_sizes)} but expected {n_stages} (stages)")
+
 		cpe_k = cfg["cpe_k"] if args.cpe_k is None else args.cpe_k
 		use_rpe = args.use_rpe or cfg["use_rpe"]
 
