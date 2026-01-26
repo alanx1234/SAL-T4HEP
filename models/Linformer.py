@@ -1,6 +1,6 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
-
+from models.PointTransformerV3TF import GeometricCPE
 
 # ---------------------------
 # Aggregation Layer (unchanged)
@@ -359,6 +359,9 @@ def build_linformer_transformer_classifier(
     output_dim=5,
     num_heads=4,
     proj_dim=4,
+    use_cpe=False,
+    cpe_k=8,
+    grid_size=0.05,
     cluster_E=False,
     cluster_F=False,
     share_EF=False,
@@ -374,6 +377,12 @@ def build_linformer_transformer_classifier(
 ):
     inputs = layers.Input((num_particles, feature_dim))
     x = layers.Dense(d_model, activation=ffn_activation)(inputs)
+    
+    if use_cpe:
+        eta = inputs[..., 1]
+        phi = inputs[..., 2]
+        x = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size)(x, eta, phi)
+
     x = LinformerTransformerBlock(
         d_model,
         d_ff,
