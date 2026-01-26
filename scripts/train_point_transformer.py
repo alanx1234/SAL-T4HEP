@@ -113,6 +113,12 @@ def apply_sorting(x, sort_by, grid_size= 0.05):
 		        phi = x[:, :, 2]
 		        idx = _morton_sort_indices_np(eta, phi, grid_size=grid_size)  # ascending
 		        return np.take_along_axis(x, idx[:, :, None], axis=1)
+		elif sort_by == "random":
+		    B, N, C = x.shape
+		    idx = np.argsort(
+		        np.random.rand(B, N), axis=1
+		    )
+		    return np.take_along_axis(x, idx[:, :, None], axis=1)
 		else:
 				return x
 		idx = np.argsort(key, axis=1)[:, ::-1]
@@ -291,7 +297,7 @@ def parse_args():
 		)
 		p.add_argument(
 				"--sort_by",
-				choices=["pt", "eta", "phi", "delta_R", "kt", "morton", "cluster"],
+				choices=["pt", "eta", "phi", "delta_R", "kt", "morton", "cluster",  "random"],
 				default="kt",
 		)
 		p.add_argument("--batch_size", type=int, default=4096)
