@@ -258,6 +258,9 @@ def parse_args():
     p.add_argument(
         "--proj_dim", type=int, default=4, help="Projection dimension for Linformer"
     )
+    p.add_argument("--use_cpe", action="store_true", help="Enable Geometric CPE")
+    p.add_argument("--cpe_k", type=int, default=8, help="CPE kernel size")
+    p.add_argument("--grid_size", type=float, default=0.05, help="GeometricCPE grid size in eta/phi")
     p.add_argument("--num_layers", type=int, default=1, help="Number of layers")
     p.add_argument("--shuffle_all", type=int, default=0, help="Shuffle all partitions")
     p.add_argument(
@@ -425,6 +428,9 @@ def main():
             aggregation=args.aggregation,
             use_layer_norm=args.use_layer_norm,
             ffn_activation=args.ffn_activation,
+            use_cpe=args.use_cpe,
+            cpe_k=args.cpe_k,
+            grid_size=args.grid_size,
         )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(),
@@ -517,7 +523,7 @@ def main():
         save_dir,
         args.sort_by,
         args.batch_size,
-        args.num_particles,
+        num_particles,
     )
 
 
