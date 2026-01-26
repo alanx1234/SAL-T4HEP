@@ -97,7 +97,12 @@ def apply_sorting(x, sort_by, grid_size = 0.05):
 		phi = x[:, :, 2]
 		idx = _morton_sort_indices_np(eta, phi, grid_size=grid_size)  # ascending
 		return np.take_along_axis(x, idx[:, :, None], axis=1)
-
+	elif sort_by == "random":
+	    B, N, C = x.shape
+	    idx = np.argsort(
+	        np.random.rand(B, N), axis=1
+	    )
+	    return np.take_along_axis(x, idx[:, :, None], axis=1)
 	else:
 		return x
 	idx = np.argsort(key, axis=1)[:, ::-1]
@@ -143,7 +148,7 @@ def main():
 	parser.add_argument("--dataset", choices=["hls4ml","top","jetclass","QG"], required=True)
 	parser.add_argument("--data_dir", required=True)
 	parser.add_argument("--save_dir", required=True)
-	parser.add_argument("--sort_by", choices=["pt","eta","phi","delta_R","kt", "morton"], default="pt")
+	parser.add_argument("--sort_by", choices=["pt","eta","phi","delta_R","kt", "morton", "random"], default="pt")
 	parser.add_argument("--batch_size", type=int, default=4096)
 	parser.add_argument("--model_size", choices=["small", "small_2layer_no_downsamp", "small_2layer_2_downsamp", "matched", "medium", "large"], default="small")
 	parser.add_argument("--enc_patch_sizes", type=int, nargs="+", default=None)
