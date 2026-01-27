@@ -248,7 +248,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--val_split", type=float, default=0.2)
     p.add_argument(
-        "--num_particles", type=int, help="Ignored for 'jetclass'; use default"
+        "--num_particles", type=int, default=150, help="Ignored for 'jetclass'; use default"
     )
     p.add_argument("--d_model", type=int, default=16, help="Transformer d_model size")
     p.add_argument(
@@ -291,6 +291,11 @@ def parse_args():
         choices=["relu", "gelu", "swish", "silu", "tanh"],
         default="relu",
         help="Activation function for feed-forward network (relu is fastest, gelu is slower but may improve accuracy)",
+    )
+    p.add_argument(
+        "--flops_only",
+        action="store_true",
+        help="Build model, report FLOPs, then exit"
     )
     p.add_argument(
         "--jit_compile",
@@ -438,6 +443,15 @@ def main():
         metrics=["accuracy"],
         jit_compile=args.jit_compile,
     )
+    flops = get_flops(model, (1, num_particles, x_train.shape[2]))
+    macs = flops // 2
+    logging.info("FLOPs per inference: %d", flops)
+    logging.info("MACs per inference: %d", macs)
+    print(f"FLOPs per inference: {flops}")
+    print(f"MACs  per inference: {macs}")
+    
+    if args.flops_only:
+        return
     model.summary(print_fn=lambda l: logging.info(l))
     logging.info("Total params: %d", model.count_params())
 
