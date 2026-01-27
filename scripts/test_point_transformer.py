@@ -16,10 +16,32 @@ import numpy as np
 import tensorflow as tf
 from sklearn.metrics import accuracy_score, roc_curve, auc, roc_auc_score
 import matplotlib.pyplot as plt
+from pathlib import Path
+
 
 from models.PointTransformerV3TF import build_ptv3_jet_classifier, build_jedi_ptv3_hybrid
 from models.PointTransformer_serialized import build_ptv3_serialized_jet_classifier
 
+def resolve_test_dir(data_dir: str, dataset: str, run_id: str):
+    data_dir = Path(data_dir)
+
+    if dataset == "top":
+        if (data_dir / "test").exists():
+            return data_dir / "test"
+        if (data_dir / run_id / "test").exists():
+            return data_dir / run_id / "test"
+        if (data_dir / "TopTagging" / run_id / "test").exists():
+            return data_dir / "TopTagging" / run_id / "test"
+
+    if dataset in ("QG", "qg"):
+        if (data_dir / "test").exists():
+            return data_dir / "test"
+        if (data_dir / "QuarkGluon" / "test").exists():
+            return data_dir / "QuarkGluon" / "test"
+
+    raise FileNotFoundError(
+        f"Could not resolve test directory for dataset={dataset}, data_dir={data_dir}"
+    )
 
 def profile_gpu_memory_during_inference(model: tf.keras.Model, input_data: np.ndarray) -> tuple[float, float]:
 	logging.info("Starting GPU memory profiling")
@@ -116,17 +138,19 @@ def load_test_data(dataset, data_dir, num_particles):
 	if dataset == "hls4ml":
 		x_test = np.load(os.path.join(data_dir, f"x_val_robust_{num_particles}const_ptetaphi.npy"))
 		y_test = np.load(os.path.join(data_dir, f"y_val_robust_{num_particles}const_ptetaphi.npy"))
-	elif dataset == "top":
-		top_dir = os.path.join(data_dir, "TopTagging", str(num_particles), "test")
-		x_test = np.load(os.path.join(top_dir, "features.npy"))
-		y_test = np.load(os.path.join(top_dir, "labels.npy"))
 	elif dataset == "jetclass":
 		x_test = np.load(os.path.join(data_dir, "JetClass/kinematics/test/features.npy"))
 		y_test = np.load(os.path.join(data_dir, "JetClass/kinematics/test/labels.npy"))
 		x_test = x_test.transpose(0, 2, 1)
-	else:  # QG
-		x_test = np.load(os.path.join(data_dir, "QuarkGluon/test/features.npy"))
-		y_test = np.load(os.path.join(data_dir, "QuarkGluon/test/labels.npy"))
+	elif dataset == "top":
+	    test_dir = resolve_test_dir(data_dir, "top", str(num_particles))
+	    x_test = np.load(os.path.join(test_dir, "features.npy"))
+	    y_test = np.load(os.path.join(test_dir, "labels.npy"))
+	else:  #QG
+	    test_dir = resolve_test_dir(data_dir, "QG", str(num_particles))  
+	    x_test = np.load(os.path.join(test_dir, "features.npy"))
+	    y_test = np.load(os.path.join(test_dir, "labels.npy"))
+		
 	logging.info("Loaded test arrays: x=%s, y=%s", x_test.shape, y_test.shape)
 	return x_test, y_test
 
