@@ -242,6 +242,10 @@ Examples:
 		model = build_jedi_linear_matched_64p3f(output_dim=output_dim)
 		num_particles = 64
 		feature_dim = 3
+	if args.preset == "matched" and args.dataset in ("QG", "top"):
+	    x = model.get_layer("global_average_pool").output 
+	    out = tf.keras.layers.Dense(1, activation="sigmoid", name="output_sigmoid")(x)
+	    model = tf.keras.Model(inputs=model.input, outputs=out)
 
 	model.summary(print_fn=lambda s: logging.info(s))
 	logging.info("Preset: %s", args.preset)
