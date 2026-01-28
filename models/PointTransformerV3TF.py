@@ -135,6 +135,12 @@ class PTv3LogLinearBlock(layers.Layer):
         use_shifted_windows=True,
         ffn_activation="gelu",
         use_cpe=False,
+        use_patch_messages=True,
+        patch_size=10,
+        patch_tokenizer_mode="mean",
+        message_proj=True,
+        message_gated=True,
+        use_rpe=False,  # for patch-level RPE (optional)
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -156,6 +162,22 @@ class PTv3LogLinearBlock(layers.Layer):
         )
         self.drop1 = layers.Dropout(dropout)
 
+        # NEW: patch messages
+        self.use_patch_messages = use_patch_messages
+        if use_patch_messages:
+            self.patch_msg = PatchMessageBroadcast(
+                d_model=d_model,
+                num_heads=num_heads,
+                patch_size=patch_size,
+                tokenizer_mode=patch_tokenizer_mode,
+                dropout=dropout,
+                use_rpe=use_rpe,
+                message_proj=message_proj,
+                gated=message_gated,
+                name="patch_message",
+            )
+            self.drop_msg = layers.Dropout(dropout)
+
         self.norm2 = layers.LayerNormalization(epsilon=1e-6)
         self.ffn = tf.keras.Sequential([
             layers.Dense(d_ff, activation=ffn_activation),
@@ -164,38 +186,32 @@ class PTv3LogLinearBlock(layers.Layer):
         ])
         self.drop2 = layers.Dropout(dropout)
 
-
     def call(self, inputs, training=False):
-        """
-        inputs: [x, coords]
-          x:      [B,T,D]
-          coords: [B,T,2] (unused by log-linear attention here, but kept for your model wiring)
-        """
         x, coords = inputs
 
-        # Optional CPE (if you still want it; I'd ablate it separately from pooling)
         if self.use_cpe and self.cpe_layer is not None:
             eta, phi = coords[..., 0], coords[..., 1]
             x = self.cpe_layer(x, eta, phi)
 
-        # Attention
         h = self.norm1(x)
-
-        # Shift -> window attention -> inverse shift
         if self.use_shift:
             h = self.shift(h, inverse=False)
             y = self.attn(h, training=training)
             y = self.shift(y, inverse=True)
         else:
             y = self.attn(h, training=training)
-
         x = x + self.drop1(y, training=training)
 
-        # FFN
+        if self.use_patch_messages:
+            m = self.patch_msg(self.norm1(x), coords, training=training)
+            x = x + self.drop_msg(m, training=training)
+
         y = self.ffn(self.norm2(x), training=training)
         x = x + self.drop2(y, training=training)
 
         return [x, coords]
+
+
 class GeometricCPE(layers.Layer):
     """
     Convolutional Position Encoding that respects jet geometry.
@@ -912,18 +928,26 @@ def build_ptv3_jet_classifier(
 
     for i in range(len(enc_dims)):
         for _ in range(enc_layers[i]):
-            x, coords = PTv3LogLinearBlock(
-                d_model=enc_dims[i],
-                d_ff=enc_dims[i] * 4,
-                num_heads=enc_heads[i],
-                window_size=enc_window_sizes[i] if isinstance(enc_window_sizes, (list, tuple)) else enc_window_sizes,
-                cpe_k=cpe_k,
-                grid_size=grid_size,
-                dropout=dropout,
-                use_shifted_windows=True,
-                ffn_activation=ffn_activation,
-                use_cpe=use_cpe,
-            )([x, coords])
+           x, coords = PTv3LogLinearBlock(
+            d_model=enc_dims[i],
+            d_ff=enc_dims[i] * 4,
+            num_heads=enc_heads[i],
+            window_size=enc_window_sizes[i] if isinstance(enc_window_sizes, (list, tuple)) else enc_window_sizes,
+            cpe_k=cpe_k,
+            grid_size=grid_size,
+            dropout=dropout,
+            use_shifted_windows=True,
+            ffn_activation=ffn_activation,
+            use_cpe=use_cpe,
+        
+            # NEW:
+            use_patch_messages=use_patch_messages,
+            patch_size=enc_patch_sizes[i] if isinstance(enc_patch_sizes, (list, tuple)) else enc_patch_sizes,
+            patch_tokenizer_mode=patch_tokenizer_mode,
+            message_proj=message_proj,
+            message_gated=message_gated,
+            use_rpe=use_rpe,   # patch-level RPE only (your window attention has no RPE)
+        )([x, coords])
 
         if i < len(enc_dims) - 1:
             if use_pool:
