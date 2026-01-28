@@ -11,7 +11,191 @@ except ImportError:
     print("Warning: Flash Attention not available in this TensorFlow version.")
 
 # ========== Core Components ==========
+class LogLinearWindowAttention(layers.Layer):
+    """
+    Log-linear (kernelized) attention computed *within* fixed windows only.
+    No T×T attention matrix is built.
 
+    Uses phi(x) = elu(x) + 1 as a positive feature map.
+    """
+    def __init__(self, d_model, num_heads, window_size, dropout=0.0, eps=1e-6,  **kwargs):
+        super().__init__(**kwargs)
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+        self.window_size = window_size
+        self.eps = eps
+        self.drop = layers.Dropout(dropout)
+
+        self.wq = layers.Dense(d_model, use_bias=True)
+        self.wk = layers.Dense(d_model, use_bias=True)
+        self.wv = layers.Dense(d_model, use_bias=True)
+        self.wo = layers.Dense(d_model, use_bias=True)
+
+    def _split_heads(self, x):
+        b = tf.shape(x)[0]
+        t = tf.shape(x)[1]
+        x = tf.reshape(x, [b, t, self.num_heads, self.d_head])
+        return tf.transpose(x, [0, 2, 1, 3])  # [B,H,T,Dh]
+
+    def _merge_heads(self, x):
+        b = tf.shape(x)[0]
+        t = tf.shape(x)[2]
+        x = tf.transpose(x, [0, 2, 1, 3])  # [B,T,H,Dh]
+        return tf.reshape(x, [b, t, self.d_model])
+
+    def _phi(self, x):
+        # positive feature map (stable + common)
+        return tf.nn.elu(x) + 1.0
+
+    def call(self, x, training=False):
+        """
+        x: [B, T, D]
+        returns: [B, T, D]
+        """
+        B = tf.shape(x)[0]
+        T = tf.shape(x)[1]
+        D = self.d_model
+        W = self.window_size
+
+        # Pad to multiple of W
+        pad_len = (W - (T % W)) % W
+        x = tf.pad(x, [[0, 0], [0, pad_len], [0, 0]])
+
+        T_pad = T + pad_len
+        NW = T_pad // W
+
+        # [B, NW, W, D] -> [B*NW, W, D]
+        xw = tf.reshape(x, [B, NW, W, D])
+        xw = tf.reshape(xw, [B * NW, W, D])
+
+        q = self._split_heads(self.wq(xw))  # [B*NW,H,W,Dh]
+        k = self._split_heads(self.wk(xw))
+        v = self._split_heads(self.wv(xw))
+
+        # (optional) scale like softmax attention usually does
+        scale = tf.cast(self.d_head, x.dtype)
+        q = q / tf.math.sqrt(scale)
+
+        q_phi = self._phi(q)  # [B*NW,H,W,Dh]
+        k_phi = self._phi(k)
+
+        # KV: [B*NW,H,Dh,Dh]
+        kv = tf.einsum("bhwd,bhwe->bhde", k_phi, v)
+
+        # Z: [B*NW,H,Dh]
+        z = tf.reduce_sum(k_phi, axis=2)
+
+        # out = (Q_phi @ KV) / (Q_phi @ z)
+        out_num = tf.einsum("bhwd,bhde->bhwe", q_phi, kv)  # [B*NW,H,W,Dh]
+        out_den = tf.einsum("bhwd,bhd->bhw", q_phi, z)     # [B*NW,H,W]
+        out_den = tf.maximum(out_den, tf.cast(self.eps, out_den.dtype))
+        out = out_num / out_den[..., None]
+
+        out = self.drop(out, training=training)
+        out = self._merge_heads(out)  # [B*NW,W,D]
+        out = self.wo(out)
+
+        # Back to [B, T_pad, D] then unpad
+        out = tf.reshape(out, [B, NW, W, D])
+        out = tf.reshape(out, [B, T_pad, D])
+        out = out[:, :T, :]
+
+        return out
+
+
+class ShiftedWindows(layers.Layer):
+    """
+    Swin-style shift along token axis to enable cross-window mixing across blocks.
+    Shift is W//2 by default.
+    """
+    def __init__(self, window_size, shift=None, **kwargs):
+        super().__init__(**kwargs)
+        self.window_size = window_size
+        self.shift = (window_size // 2) if shift is None else shift
+
+    def call(self, x, inverse=False):
+        if self.shift == 0:
+            return x
+        s = self.shift if not inverse else -self.shift
+        return tf.roll(x, shift=s, axis=1)
+
+
+class PTv3LogLinearBlock(layers.Layer):
+    def __init__(
+        self,
+        d_model,
+        d_ff,
+        num_heads,
+        window_size,
+        cpe_k=8,
+        grid_size=0.05,
+        dropout=0.0,
+        use_shifted_windows=True,
+        ffn_activation="gelu",
+        use_cpe=False,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        assert ffn_activation in ("relu", "gelu")
+
+        self.use_cpe = use_cpe
+        self.cpe_layer = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size) if use_cpe else None
+
+        self.use_shift = use_shifted_windows
+        self.shift = ShiftedWindows(window_size) if use_shifted_windows else None
+
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.attn = LogLinearWindowAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            window_size=window_size,
+            dropout=dropout,
+            name="log_linear_window_attn",
+        )
+        self.drop1 = layers.Dropout(dropout)
+
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.ffn = tf.keras.Sequential([
+            layers.Dense(d_ff, activation=ffn_activation),
+            layers.Dropout(dropout),
+            layers.Dense(d_model),
+        ])
+        self.drop2 = layers.Dropout(dropout)
+
+
+    def call(self, inputs, training=False):
+        """
+        inputs: [x, coords]
+          x:      [B,T,D]
+          coords: [B,T,2] (unused by log-linear attention here, but kept for your model wiring)
+        """
+        x, coords = inputs
+
+        # Optional CPE (if you still want it; I'd ablate it separately from pooling)
+        if self.use_cpe and self.cpe_layer is not None:
+            eta, phi = coords[..., 0], coords[..., 1]
+            x = self.cpe_layer(x, eta, phi)
+
+        # Attention
+        h = self.norm1(x)
+
+        # Shift -> window attention -> inverse shift
+        if self.use_shift:
+            h = self.shift(h, inverse=False)
+            y = self.attn(h, training=training)
+            y = self.shift(y, inverse=True)
+        else:
+            y = self.attn(h, training=training)
+
+        x = x + self.drop1(y, training=training)
+
+        # FFN
+        y = self.ffn(self.norm2(x), training=training)
+        x = x + self.drop2(y, training=training)
+
+        return [x, coords]
 class GeometricCPE(layers.Layer):
     """
     Convolutional Position Encoding that respects jet geometry.
@@ -710,6 +894,7 @@ def build_ptv3_jet_classifier(
     use_pool=True,
     dropout=0.0,
     aggregation="max",
+    enc_window_sizes=20,
     ffn_activation="gelu",
     use_patch_messages=True,
     patch_tokenizer_mode="mean",   # "mean","max","flatten_dense","learned_pool"
@@ -727,22 +912,17 @@ def build_ptv3_jet_classifier(
 
     for i in range(len(enc_dims)):
         for _ in range(enc_layers[i]):
-            x, coords = PTv3Block(
+            x, coords = PTv3LogLinearBlock(
                 d_model=enc_dims[i],
                 d_ff=enc_dims[i] * 4,
                 num_heads=enc_heads[i],
-                patch_size=enc_patch_sizes[i],
+                window_size=enc_window_sizes[i] if isinstance(enc_window_sizes, (list, tuple)) else enc_window_sizes,
                 cpe_k=cpe_k,
                 grid_size=grid_size,
                 dropout=dropout,
-                use_rpe=use_rpe,
-                use_cpe=use_cpe,
+                use_shifted_windows=True,
                 ffn_activation=ffn_activation,
-                use_patch_messages=use_patch_messages,
-                patch_tokenizer_mode=patch_tokenizer_mode,
-                message_proj=message_proj,
-                message_gated=message_gated,
-                use_flash_attention=use_flash_attention
+                use_cpe=use_cpe,
             )([x, coords])
 
         if i < len(enc_dims) - 1:
