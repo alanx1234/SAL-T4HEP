@@ -450,7 +450,7 @@ def main():
 			head_hidden_dims=args.head_hidden,
 		)
 	if args.preset == "matched" and args.dataset in ["QG", "top"]:
-		x = model.layers[-2].output          
+		x = model.get_layer("global_average_pool").output         
 		out = tf.keras.layers.Dense(1, activation="sigmoid", name="output_sigmoid")(x)
 		model = tf.keras.Model(inputs=model.input, outputs=out)
 	# compile model
