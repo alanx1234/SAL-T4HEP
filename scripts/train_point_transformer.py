@@ -329,6 +329,7 @@ def parse_args():
 		p.add_argument("--no_message_proj", dest="message_proj", action="store_false")
 		p.add_argument("--message_gated", dest="message_gated", action="store_true", default=False)
 		p.add_argument("--no_message_gated", dest="message_gated", action="store_false")
+		p.add_argument("--enc_window_sizes", type=int, nargs="+", default=None, help="Sliding-window size per stage. 1 value to broadcast, or one per stage.")
 		g = p.add_mutually_exclusive_group()
 		g.add_argument("--use_patch_messages", dest="use_patch_messages", action="store_true", default=True, help="Enable patch-message pathway (default: on)")
 		g.add_argument("--no_use_patch_messages", dest="use_patch_messages", action="store_false", help="Disable patch-message pathway (patch tokenizer/proj/gate become irrelevant)")
@@ -429,6 +430,22 @@ def main():
 		enc_strides = cfg["enc_strides"]
 		enc_patch_sizes = cfg["enc_patch_sizes"] if args.enc_patch_sizes is None else args.enc_patch_sizes
 		n_stages = len(enc_dims)
+		enc_window_sizes = args.enc_window_sizes
+		if enc_window_sizes is None:
+		    enc_window_sizes = [20]
+		
+		if len(enc_window_sizes) == 1 and n_stages > 1:
+		    enc_window_sizes = enc_window_sizes * n_stages
+		
+		if len(enc_window_sizes) != n_stages:
+		    raise ValueError(
+		        f"enc_window_sizes has len {len(enc_window_sizes)} but expected {n_stages} (stages)"
+		    )
+		
+		logging.info("Resolved enc_window_sizes: %s", enc_window_sizes)
+
+		if enc_window_sizes is None:
+		    enc_window_sizes = [20]
 		if len(enc_patch_sizes) == 1 and n_stages > 1:
 		    enc_patch_sizes = enc_patch_sizes * n_stages  # broadcast single value
 		if len(enc_patch_sizes) != n_stages:
@@ -473,10 +490,13 @@ def main():
 				serialize_by=args.serialize_by,
 			)
 		else:
+			args.use_patch_messages = False
+			args.use_flash_attention = False
 			model = build_ptv3_jet_classifier(
 				num_particles=num_particles,
 				output_dim=output_dim,
 				enc_dims=enc_dims,
+				enc_window_sizes=enc_window_sizes,
 				enc_layers=enc_layers,
 				enc_heads=enc_heads,
 				enc_patch_sizes=enc_patch_sizes,
