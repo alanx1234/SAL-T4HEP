@@ -928,26 +928,26 @@ def build_ptv3_jet_classifier(
 
     for i in range(len(enc_dims)):
         for _ in range(enc_layers[i]):
-           x, coords = PTv3LogLinearBlock(
-            d_model=enc_dims[i],
-            d_ff=enc_dims[i] * 4,
-            num_heads=enc_heads[i],
-            window_size=enc_window_sizes[i] if isinstance(enc_window_sizes, (list, tuple)) else enc_window_sizes,
-            cpe_k=cpe_k,
-            grid_size=grid_size,
-            dropout=dropout,
-            use_shifted_windows=True,
-            ffn_activation=ffn_activation,
-            use_cpe=use_cpe,
-        
-            # NEW:
-            use_patch_messages=use_patch_messages,
-            patch_size=enc_patch_sizes[i] if isinstance(enc_patch_sizes, (list, tuple)) else enc_patch_sizes,
-            patch_tokenizer_mode=patch_tokenizer_mode,
-            message_proj=message_proj,
-            message_gated=message_gated,
-            use_rpe=use_rpe,   # patch-level RPE only (your window attention has no RPE)
-        )([x, coords])
+            x, coords = PTv3LogLinearBlock(
+                d_model=enc_dims[i],
+                d_ff=enc_dims[i] * 4,
+                num_heads=enc_heads[i],
+                window_size=enc_window_sizes[i] if isinstance(enc_window_sizes, (list, tuple)) else enc_window_sizes,
+                cpe_k=cpe_k,
+                grid_size=grid_size,
+                dropout=dropout,
+                use_shifted_windows=True,
+                ffn_activation=ffn_activation,
+                use_cpe=use_cpe,
+            
+                # NEW:
+                use_patch_messages=use_patch_messages,
+                patch_size=enc_patch_sizes[i] if isinstance(enc_patch_sizes, (list, tuple)) else enc_patch_sizes,
+                patch_tokenizer_mode=patch_tokenizer_mode,
+                message_proj=message_proj,
+                message_gated=message_gated,
+                use_rpe=use_rpe,   # patch-level RPE only (your window attention has no RPE)
+            )([x, coords])
 
         if i < len(enc_dims) - 1:
             if use_pool:
