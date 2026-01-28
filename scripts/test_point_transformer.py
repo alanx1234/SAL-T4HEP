@@ -193,6 +193,7 @@ def main():
 		default="morton",
 		help="Serialization strategy for the serialized PTv3 model",
 	)
+	parser.add_argument("--enc_window_sizes", type=int,nargs="+", default=None, help="Sliding-window size per stage. 1 value to broadcast, or one per stage.")
 	parser.add_argument("--ffn_activation", choices=["relu", "gelu", "swish", "silu", "tanh"], default="gelu", help="Activation function for feed-forward network (relu is fastest, gelu is default)")
 	parser.add_argument("--use_jedi_hybrid", action="store_true", help="Use JEDI-PTv3 Hybrid (O(N) global interaction)")
 	parser.add_argument("--disable_cpe", action="store_true", help="Disable CPE in JEDI hybrid")
@@ -254,6 +255,21 @@ def main():
 	enc_strides = cfg["enc_strides"]
 	enc_patch_sizes = cfg["enc_patch_sizes"] if args.enc_patch_sizes is None else args.enc_patch_sizes
 	n_stages = len(enc_dims)
+
+	enc_window_sizes = args.enc_window_sizes
+	if enc_window_sizes is None:
+	    enc_window_sizes = [20]  
+	
+	if len(enc_window_sizes) == 1 and n_stages > 1:
+	    enc_window_sizes = enc_window_sizes * n_stages
+	
+	if len(enc_window_sizes) != n_stages:
+	    raise ValueError(
+	        f"enc_window_sizes has len {len(enc_window_sizes)} but expected {n_stages} (stages)"
+	    )
+
+	logging.info("Resolved enc_window_sizes: %s", enc_window_sizes)
+	
 	if len(enc_patch_sizes) == 1 and n_stages > 1:
 		    enc_patch_sizes = enc_patch_sizes * n_stages  # broadcast single value
 	if len(enc_patch_sizes) != n_stages:
@@ -308,6 +324,7 @@ def main():
 				enc_strides=enc_strides,
 				enc_heads=enc_heads,
 				enc_patch_sizes=enc_patch_sizes,
+				enc_window_sizes=enc_window_sizes,
 				use_rpe=use_rpe,
 				cpe_k=cpe_k,
 				grid_size=args.grid_size,
