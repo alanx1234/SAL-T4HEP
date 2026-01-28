@@ -449,7 +449,10 @@ def main():
 			dropout_rate=args.dropout,
 			head_hidden_dims=args.head_hidden,
 		)
-
+	if args.preset == "matched" and args.dataset in ["QG", "top"]:
+		x = model.layers[-2].output          
+		out = tf.keras.layers.Dense(1, activation="sigmoid", name="output_sigmoid")(x)
+		model = tf.keras.Model(inputs=model.input, outputs=out)
 	# compile model
 	model.compile(
 		optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
