@@ -222,6 +222,12 @@ def main():
 	    action="store_false",
 	    help="Disable patch-message pathway (patch tokenizer/proj/gate become irrelevant)"
 	)
+	parser.add_argument(
+	    "--cpe_coord_mode",
+	    choices=["raw", "pt"],
+	    default="raw",
+	    help='GeometricCPE coord mode: "raw"=(eta,phi), "pt"=(pt*eta, pt*phi)'
+		)
 	args = parser.parse_args()
 
 	# Logging
@@ -314,6 +320,7 @@ def main():
 				use_pool=(not args.disable_pool),
 				use_cpe=(not args.disable_cpe),
 				dropout=0.0,
+				cpe_coord_mode=args.cpe_coord_mode,   
 				aggregation=args.aggregation,
 				ffn_activation=args.ffn_activation,
 				use_patch_messages=args.use_patch_messages,
