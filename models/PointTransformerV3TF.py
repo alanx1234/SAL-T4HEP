@@ -12,16 +12,53 @@ except ImportError:
 
 # ========== Core Components ==========
 
+# --- Angle helpers (ported from parT.py) ---
+
+def wrap_to_pi(x: tf.Tensor) -> tf.Tensor:
+    """Map angles to (-pi, pi]."""
+    pi = tf.constant(math.pi, dtype=x.dtype)
+    return tf.math.floormod(x + pi, 2.0 * pi) - pi
+
+
+def unwrap_phi_per_jet(phi: tf.Tensor, mask: tf.Tensor | None = None) -> tf.Tensor:
+    """
+    Seam-safe per-jet centering of phi.
+    Computes a circular mean direction per jet and returns dphi = wrap_to_pi(phi - phi0).
+    mask: [B, N] bool where True means *real* (not padded).
+    """
+    if mask is None:
+        sin_mean = tf.reduce_mean(tf.sin(phi), axis=1, keepdims=True)
+        cos_mean = tf.reduce_mean(tf.cos(phi), axis=1, keepdims=True)
+    else:
+        w = tf.cast(mask, phi.dtype)
+        denom = tf.reduce_sum(w, axis=1, keepdims=True)
+        denom = tf.maximum(denom, tf.cast(1.0, phi.dtype))
+        sin_mean = tf.reduce_sum(tf.sin(phi) * w, axis=1, keepdims=True) / denom
+        cos_mean = tf.reduce_sum(tf.cos(phi) * w, axis=1, keepdims=True) / denom
+
+    phi0 = tf.atan2(sin_mean, cos_mean)  # [B,1]
+    return wrap_to_pi(phi - phi0)
+
+
 class GeometricCPE(layers.Layer):
     """
     Convolutional Position Encoding that respects jet geometry.
-    Uses 2D convolution on (eta, phi) grid.
+
+    Fixes the phi seam issue by centering phi per-jet (circular mean) before quantization,
+    so jets straddling the -x axis (phi ~ +/- pi) don't explode the grid width.
+
+    coord_mode:
+      - "raw": quantize on (eta, centered_phi)
+      - "pt" : quantize on (pt*eta, pt*centered_phi)
     """
-    def __init__(self, channels, kernel_size=3, grid_size=0.05, **kwargs):
+    def __init__(self, channels, kernel_size=3, grid_size=0.05, coord_mode="raw", **kwargs):
         super().__init__(**kwargs)
+        if coord_mode not in ("raw", "pt"):
+            raise ValueError('coord_mode must be "raw" or "pt"')
         self.channels = channels
         self.kernel_size = kernel_size
         self.grid_size = grid_size
+        self.coord_mode = coord_mode
 
         # Depthwise conv via groups=channels (Keras supports this)
         self.conv2d = layers.Conv2D(
@@ -34,34 +71,77 @@ class GeometricCPE(layers.Layer):
         self.pointwise = layers.Dense(channels)
         self.norm = layers.LayerNormalization(epsilon=1e-6)
 
-    def call(self, x, eta, phi):
+    def call(self, x, pt, eta, phi, mask=None):
         """
         Args:
-            x: Features [B, N, C]
+            x:   Features [B, N, C]
+            pt:  Particle pt [B, N]
             eta: Particle eta [B, N]
-            phi: Particle phi [B, N]
+            phi: Particle phi [B, N] (radians, possibly straddling +/-pi)
+            mask: optional [B, N] bool where True means real (not padded)
         """
         B = tf.shape(x)[0]
         N = tf.shape(x)[1]
         C = self.channels
         residual = x
 
-        # Quantize to grid per batch element (min-shifted)
-        eta_min = tf.reduce_min(eta, axis=1, keepdims=True)
-        phi_min = tf.reduce_min(phi, axis=1, keepdims=True)
-        grid_eta = tf.cast((eta - eta_min) / self.grid_size, tf.int32)
-        grid_phi = tf.cast((phi - phi_min) / self.grid_size, tf.int32)
+        # seam-safe phi per jet
+        phi_centered = unwrap_phi_per_jet(phi, mask=mask)
+
+        if self.coord_mode == "pt":
+            c1 = pt * eta
+            c2 = pt * phi_centered
+        else:
+            c1 = eta
+            c2 = phi_centered
+
+        # Quantize to grid per batch element (min-shifted), but compute mins over real particles only
+        if mask is not None:
+            inf = tf.cast(1e9, c1.dtype)
+            c1_for_min = tf.where(mask, c1, inf)
+            c2_for_min = tf.where(mask, c2, inf)
+            c1_min = tf.reduce_min(c1_for_min, axis=1, keepdims=True)
+            c2_min = tf.reduce_min(c2_for_min, axis=1, keepdims=True)
+
+            # if a jet is fully padded, mins become inf -> reset to 0
+            c1_min = tf.where(tf.math.is_finite(c1_min), c1_min, tf.zeros_like(c1_min))
+            c2_min = tf.where(tf.math.is_finite(c2_min), c2_min, tf.zeros_like(c2_min))
+
+            c1_shift = tf.where(mask, c1 - c1_min, tf.zeros_like(c1))
+            c2_shift = tf.where(mask, c2 - c2_min, tf.zeros_like(c2))
+        else:
+            c1_min = tf.reduce_min(c1, axis=1, keepdims=True)
+            c2_min = tf.reduce_min(c2, axis=1, keepdims=True)
+            c1_shift = c1 - c1_min
+            c2_shift = c2 - c2_min
+
+        grid_eta = tf.cast(tf.floor(c1_shift / self.grid_size), tf.int32)
+        grid_phi = tf.cast(tf.floor(c2_shift / self.grid_size), tf.int32)
+
+        if mask is not None:
+            # Force padded tokens into (0,0) and zero their features before scatter
+            grid_eta = tf.where(mask, grid_eta, tf.zeros_like(grid_eta))
+            grid_phi = tf.where(mask, grid_phi, tf.zeros_like(grid_phi))
+            x_scatter = tf.where(mask[..., None], x, tf.zeros_like(x))
+        else:
+            x_scatter = x
 
         # Global (over batch) grid dims (safe, may over-allocate slightly)
         H = tf.reduce_max(grid_eta) + 1
         W = tf.reduce_max(grid_phi) + 1
+        H = tf.maximum(H, 1)
+        W = tf.maximum(W, 1)
+
+        # Clamp indices
+        grid_eta = tf.clip_by_value(grid_eta, 0, H - 1)
+        grid_phi = tf.clip_by_value(grid_phi, 0, W - 1)
 
         batch_idx = tf.range(B)[:, None]
         batch_idx = tf.tile(batch_idx, [1, N])
 
         indices = tf.stack([batch_idx, grid_eta, grid_phi], axis=-1)  # [B, N, 3]
         flat_indices = tf.reshape(indices, [-1, 3])
-        flat_features = tf.reshape(x, [-1, C])
+        flat_features = tf.reshape(x_scatter, [-1, C])
 
         grid = tf.scatter_nd(flat_indices, flat_features, [B, H, W, C])
         grid = self.conv2d(grid)
@@ -519,7 +599,7 @@ class GeometricPooling(layers.Layer):
         self.norm = layers.LayerNormalization(epsilon=1e-6)
 
     def call(self, inputs):
-        x, coords = inputs
+        x, coords, pt, mask = inputs
         B, N = tf.shape(x)[0], tf.shape(x)[1]
         channels = x.shape[-1]
         eta = coords[..., 0]
@@ -531,6 +611,8 @@ class GeometricPooling(layers.Layer):
 
         x_sorted = tf.gather_nd(x, gather_idx)
         coords_sorted = tf.gather_nd(coords, gather_idx)
+        pt_sorted = tf.gather_nd(pt, gather_idx)
+        mask_sorted = tf.gather_nd(mask, gather_idx)
 
         N_out = N // self.stride
         remainder = N % self.stride
@@ -538,18 +620,25 @@ class GeometricPooling(layers.Layer):
             pad_len = self.stride - remainder
             x_sorted = tf.pad(x_sorted, [[0, 0], [0, pad_len], [0, 0]])
             coords_sorted = tf.pad(coords_sorted, [[0, 0], [0, pad_len], [0, 0]])
+            pt_sorted = tf.pad(pt_sorted, [[0, 0], [0, pad_len]])
+            mask_sorted = tf.pad(mask_sorted, [[0, 0], [0, pad_len]])
             N_out = (N + pad_len) // self.stride
 
         x_grouped = tf.reshape(x_sorted, [B, N_out, self.stride, channels])
         coords_grouped = tf.reshape(coords_sorted, [B, N_out, self.stride, 2])
+        pt_grouped = tf.reshape(pt_sorted, [B, N_out, self.stride])
+        mask_grouped = tf.reshape(mask_sorted, [B, N_out, self.stride])
 
+        # Pool features; for padded tokens, x should already be near-zero, but we keep mask anyway.
         x_pooled = tf.reduce_max(x_grouped, axis=2)
         coords_pooled = tf.reduce_mean(coords_grouped, axis=2)
+        pt_pooled = tf.reduce_max(pt_grouped, axis=2)
+        mask_pooled = tf.reduce_any(mask_grouped, axis=2)
 
         x_pooled = tf.ensure_shape(x_pooled, [None, None, channels])
         x_pooled = self.proj(x_pooled)
         x_pooled = self.norm(x_pooled)
-        return [x_pooled, coords_pooled]
+        return [x_pooled, coords_pooled, pt_pooled, mask_pooled]
 
 
 # =========================
@@ -559,10 +648,17 @@ class GeometricPooling(layers.Layer):
 class PTv3Block(layers.Layer):
     """
     Local patched attention + optional patch-to-patch message passing + FFN.
-    No TÃ—T attention is ever built.
+    No T×T attention is ever built.
+
+    Inputs/Outputs are tuples:
+      x:     [B, T, D]
+      coords:[B, T, 2] (eta, phi)
+      pt:    [B, T]
+      mask:  [B, T] bool (True for real tokens)
 
     Options:
       - use_cpe: enable/disable GeometricCPE
+      - cpe_coord_mode: "raw" or "pt" for GeometricCPE quantization
       - ffn_activation: "relu" or "gelu"
       - use_patch_messages: enable/disable patch-to-patch messages
       - patch_tokenizer_mode: how to build patch tokens ("mean","max","flatten_dense","learned_pool")
@@ -576,6 +672,7 @@ class PTv3Block(layers.Layer):
         patch_size,
         cpe_k=8,
         grid_size=0.05,
+        cpe_coord_mode="raw",
         dropout=0.0,
         use_rpe=False,
         use_cpe=True,
@@ -592,7 +689,7 @@ class PTv3Block(layers.Layer):
 
         self.use_cpe = use_cpe
         if use_cpe:
-            self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size)
+            self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size, coord_mode=cpe_coord_mode)
 
         self.norm1 = layers.LayerNormalization(epsilon=1e-6)
         self.attn = PatchedAttention(d_model, num_heads, patch_size, dropout=dropout, use_rpe=use_rpe, use_flash_attention=use_flash_attention)
@@ -622,12 +719,12 @@ class PTv3Block(layers.Layer):
         self.drop2 = layers.Dropout(dropout)
 
     def call(self, inputs, training=False):
-        x, coords = inputs
+        x, coords, pt, mask = inputs
         eta, phi = coords[..., 0], coords[..., 1]
 
-        # optional CPE
+        # optional CPE (with seam-safe phi)
         if self.use_cpe:
-            x = self.cpe(x, eta, phi)
+            x = self.cpe(x, pt, eta, phi, mask=mask)
 
         # local patched attention
         y = self.attn(self.norm1(x), coords, training=training)
@@ -642,22 +739,30 @@ class PTv3Block(layers.Layer):
         y = self.ffn(self.norm2(x), training=training)
         x = x + self.drop2(y, training=training)
 
-        return [x, coords]
+        return [x, coords, pt, mask]
 
 
 class JEDIPTv3Block(layers.Layer):
     """
     Hybrid: optional CPE + JEDI GlobalInteraction + FFN.
+
+    Inputs/Outputs are tuples:
+      x:     [B, T, D]
+      coords:[B, T, 2] (eta, phi)
+      pt:    [B, T]
+      mask:  [B, T] bool
+
     Options:
       - use_cpe
+      - cpe_coord_mode: "raw" or "pt"
       - ffn_activation: "relu" or "gelu"
     """
-    def __init__(self, d_model, d_ff, cpe_k=8, grid_size=0.05, dropout=0.0, use_cpe=True, ffn_activation="relu", **kwargs):
+    def __init__(self, d_model, d_ff, cpe_k=8, grid_size=0.05, cpe_coord_mode="raw", dropout=0.0, use_cpe=True, ffn_activation="relu", **kwargs):
         super().__init__(**kwargs)
         assert ffn_activation in ("relu", "gelu")
         self.use_cpe = use_cpe
         if use_cpe:
-            self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size)
+            self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size, coord_mode=cpe_coord_mode)
 
         self.global_interaction = GlobalInteractionLayer(d_model)
         self.drop1 = layers.Dropout(dropout)
@@ -672,11 +777,11 @@ class JEDIPTv3Block(layers.Layer):
         self.norm2 = layers.BatchNormalization()
 
     def call(self, inputs, training=False):
-        x, coords = inputs
+        x, coords, pt, mask = inputs
         eta, phi = coords[..., 0], coords[..., 1]
 
         if self.use_cpe:
-            x = self.cpe(x, eta, phi)
+            x = self.cpe(x, pt, eta, phi, mask=mask)
 
         y = self.global_interaction(x, training=training)
         y = self.drop1(y, training=training)
@@ -688,7 +793,7 @@ class JEDIPTv3Block(layers.Layer):
         x = x + y
         x = self.norm2(x, training=training)
 
-        return [x, coords]
+        return [x, coords, pt, mask]
 
 
 # =========================
@@ -705,6 +810,7 @@ def build_ptv3_jet_classifier(
     enc_strides=[2, 2],
     cpe_k=8,
     grid_size=0.05,
+    cpe_coord_mode="raw",
     use_rpe=False,
     use_cpe=True,
     use_pool=True,
@@ -722,18 +828,21 @@ def build_ptv3_jet_classifier(
     # Input: [pt, eta, phi]
     features_input = layers.Input((num_particles, 3), name="features")
 
+    pt = features_input[..., 0]
     coords = features_input[..., 1:3]  # [eta, phi]
+    mask = tf.greater(pt, 0.0)
     x = layers.Dense(enc_dims[0], activation="relu")(features_input)
 
     for i in range(len(enc_dims)):
         for _ in range(enc_layers[i]):
-            x, coords = PTv3Block(
+            x, coords, pt, mask = PTv3Block(
                 d_model=enc_dims[i],
                 d_ff=enc_dims[i] * 4,
                 num_heads=enc_heads[i],
                 patch_size=enc_patch_sizes[i],
                 cpe_k=cpe_k,
                 grid_size=grid_size,
+                cpe_coord_mode=cpe_coord_mode,
                 dropout=dropout,
                 use_rpe=use_rpe,
                 use_cpe=use_cpe,
@@ -743,14 +852,14 @@ def build_ptv3_jet_classifier(
                 message_proj=message_proj,
                 message_gated=message_gated,
                 use_flash_attention=use_flash_attention
-            )([x, coords])
+            )([x, coords, pt, mask])
 
         if i < len(enc_dims) - 1:
             if use_pool:
-                x, coords = GeometricPooling(
+                x, coords, pt, mask  = GeometricPooling(
                     out_dim=enc_dims[i + 1],
                     stride=enc_strides[i]
-                )([x, coords])
+                )([x, coords, pt, mask])
             else:
                 x = layers.Dense(enc_dims[i + 1])(x)
 
@@ -773,6 +882,7 @@ def build_jedi_ptv3_hybrid(
     enc_strides=[2, 2],
     cpe_k=8,
     grid_size=0.05,
+    cpe_coord_mode="raw",
     use_pool=True,
     use_cpe=True,
     dropout=0.0,
@@ -810,27 +920,30 @@ def build_jedi_ptv3_hybrid(
 
     # Input: [pt, eta, phi]
     features_input = layers.Input((num_particles, 3), name="features")
+    pt = features_input[..., 0]
     coords = features_input[..., 1:3]
+    mask = tf.greater(pt, 0.0)
     x = layers.Dense(enc_dims[0], activation="relu")(features_input)
 
     for i in range(len(enc_dims)):
         for _ in range(enc_layers[i]):
-            x, coords = JEDIPTv3Block(
+            x, coords, pt, mask = JEDIPTv3Block(
                 d_model=enc_dims[i],
                 d_ff=enc_dims[i] * 4,
                 cpe_k=cpe_k,
                 grid_size=grid_size,
+                cpe_coord_mode=cpe_coord_mode,
                 dropout=dropout,
                 use_cpe=use_cpe,
                 ffn_activation=ffn_activation,
-            )([x, coords])
+            )([x, coords, pt, mask])
 
         if i < len(enc_dims) - 1:
             if use_pool:
-                x, coords = GeometricPooling(
+                x, coords, pt, mask = GeometricPooling(
                     out_dim=enc_dims[i + 1],
                     stride=enc_strides[i]
-                )([x, coords])
+                )([x, coords, pt, mask])
             else:
                 x = layers.Dense(enc_dims[i + 1])(x)
 
