@@ -89,8 +89,9 @@ class GeometricCPE(layers.Layer):
         phi_centered = unwrap_phi_per_jet(phi, mask=mask)
 
         if self.coord_mode == "pt":
-            c1 = pt * eta
-            c2 = pt * phi_centered
+            pt_eff = tf.abs(pt)
+            c1 = pt_eff * eta
+            c2 = pt_eff * phi_centered
         else:
             c1 = eta
             c2 = phi_centered
@@ -830,7 +831,7 @@ def build_ptv3_jet_classifier(
 
     pt = features_input[..., 0]
     coords = features_input[..., 1:3]  # [eta, phi]
-    mask = tf.greater(pt, 0.0)
+    mask = tf.abs(pt) > 1e-6
     x = layers.Dense(enc_dims[0], activation="relu")(features_input)
 
     for i in range(len(enc_dims)):
