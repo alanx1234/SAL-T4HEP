@@ -89,7 +89,9 @@ class GeometricCPE(layers.Layer):
         phi_centered = unwrap_phi_per_jet(phi, mask=mask)
 
         if self.coord_mode == "pt":
+            clip_max = 10.0
             pt_eff = tf.abs(pt)
+            pt_eff = clip_max * pt_eff / (pt_eff + clip_max)
             c1 = pt_eff * eta
             c2 = pt_eff * phi_centered
         else:
