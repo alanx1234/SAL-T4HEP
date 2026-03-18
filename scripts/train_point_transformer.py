@@ -427,6 +427,7 @@ def main():
 		x_val   = apply_sorting(x_val,   args.sort_by, grid_size=args.morton_grid_size)
 
 		# truncate to top-k particles if requested (e.g. 64 instead of 128)
+		num_particles_for_files = num_particles  # preserve original for filename lookup in run_testing
 		if args.num_particles_truncate is not None:
 				k = args.num_particles_truncate
 				assert k <= num_particles, f"--num_particles_truncate={k} > num_particles={num_particles}"
@@ -614,7 +615,7 @@ def main():
 				save_dir,
 				args.sort_by,
 				args.batch_size,
-				num_particles,
+				num_particles_for_files,
 				morton_grid_size=args.morton_grid_size,
 				num_particles_truncate=args.num_particles_truncate,
 		)
