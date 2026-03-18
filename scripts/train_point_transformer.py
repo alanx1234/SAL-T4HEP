@@ -158,7 +158,7 @@ def choose_divisible_patch_sizes(stage_lengths, preferred=[64, 32, 16, 8, 4, 2, 
 # ---------------------------
 # Testing / Profiling
 # ---------------------------
-def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size, num_particles_truncate=None):
+def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size, num_particles_truncate=None, enc_patch_sizes=None):
 		logging.info("Starting testing phase...")
 
 		# load test set
@@ -187,6 +187,15 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 		if num_particles_truncate is not None:
 				x_test = x_test[:, :num_particles_truncate, :]
 				logging.info("Truncated TEST set to top-%d particles", num_particles_truncate)
+
+		# zero-pad to nearest multiple of patch size if needed
+		if enc_patch_sizes is not None:
+				max_patch = max(enc_patch_sizes)
+				remainder = x_test.shape[1] % max_patch
+				if remainder != 0:
+						pad_len = max_patch - remainder
+						x_test = np.pad(x_test, ((0,0),(0,pad_len),(0,0)))
+						logging.info("Padded TEST set to %d particles for patch_size=%d", x_test.shape[1], max_patch)
 
 		# flops & macs
 		num_p, feat_d = x_test.shape[1], x_test.shape[2]
@@ -435,6 +444,8 @@ def main():
 				x_val   = x_val[:,   :k, :]
 				num_particles = k
 				logging.info("Truncated to top-%d particles after sorting", k)
+		else:
+				num_particles_for_files = num_particles
 
 		# select preset
 		presets = {
@@ -459,6 +470,17 @@ def main():
 
 		cpe_k = cfg["cpe_k"] if args.cpe_k is None else args.cpe_k
 		use_rpe = args.use_rpe or cfg["use_rpe"]
+
+		# zero-pad sequence to nearest multiple of patch size if needed
+		# (avoids gradient shape mismatch from padding inside attention layer)
+		max_patch = max(enc_patch_sizes)
+		remainder = num_particles % max_patch
+		if remainder != 0:
+				pad_len = max_patch - remainder
+				x_train = np.pad(x_train, ((0,0),(0,pad_len),(0,0)))
+				x_val   = np.pad(x_val,   ((0,0),(0,pad_len),(0,0)))
+				num_particles = num_particles + pad_len
+				logging.info("Padded sequence to %d particles for patch_size=%d", num_particles, max_patch)
 
 		# build and compile model
 		logging.info("Flash Attention enabled: %s", args.use_flash_attention)
@@ -618,6 +640,7 @@ def main():
 				num_particles_for_files,
 				morton_grid_size=args.morton_grid_size,
 				num_particles_truncate=args.num_particles_truncate,
+				enc_patch_sizes=enc_patch_sizes,
 		)
 
 
