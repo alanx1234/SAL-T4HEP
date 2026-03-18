@@ -158,7 +158,7 @@ def choose_divisible_patch_sizes(stage_lengths, preferred=[64, 32, 16, 8, 4, 2, 
 # ---------------------------
 # Testing / Profiling
 # ---------------------------
-def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size):
+def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size, num_particles_truncate=None):
 		logging.info("Starting testing phase...")
 
 		# load test set
@@ -182,6 +182,11 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 		# sorting for test
 		x_test = apply_sorting(x_test, sort_by, grid_size=morton_grid_size)
 		logging.info("Applied '%s' sorting to TEST set", sort_by)
+
+		# truncate to top-k if requested
+		if num_particles_truncate is not None:
+				x_test = x_test[:, :num_particles_truncate, :]
+				logging.info("Truncated TEST set to top-%d particles", num_particles_truncate)
 
 		# flops & macs
 		num_p, feat_d = x_test.shape[1], x_test.shape[2]
@@ -302,6 +307,8 @@ def parse_args():
 		)
 		p.add_argument("--batch_size", type=int, default=4096)
 		p.add_argument("--val_split", type=float, default=0.2)
+		p.add_argument("--num_particles_truncate", type=int, default=None,
+				help="If set, truncate to this many particles after sorting (e.g. 64 to keep top-64 by pt)")
 
 		# Model hyperparameters
 		p.add_argument("--enc_dims", type=int, nargs="+", default=[12, 24, 32])
@@ -418,6 +425,15 @@ def main():
 		# apply sorting
 		x_train = apply_sorting(x_train, args.sort_by, grid_size=args.morton_grid_size)
 		x_val   = apply_sorting(x_val,   args.sort_by, grid_size=args.morton_grid_size)
+
+		# truncate to top-k particles if requested (e.g. 64 instead of 128)
+		if args.num_particles_truncate is not None:
+				k = args.num_particles_truncate
+				assert k <= num_particles, f"--num_particles_truncate={k} > num_particles={num_particles}"
+				x_train = x_train[:, :k, :]
+				x_val   = x_val[:,   :k, :]
+				num_particles = k
+				logging.info("Truncated to top-%d particles after sorting", k)
 
 		# select preset
 		presets = {
@@ -599,11 +615,10 @@ def main():
 				args.sort_by,
 				args.batch_size,
 				num_particles,
-				morton_grid_size=args.morton_grid_size
+				morton_grid_size=args.morton_grid_size,
+				num_particles_truncate=args.num_particles_truncate,
 		)
 
 
 if __name__ == "__main__":
 		main()
-
-
