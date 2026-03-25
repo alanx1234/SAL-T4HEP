@@ -314,6 +314,13 @@ def parse_args():
 				choices=["pt", "eta", "phi", "delta_R", "kt", "morton", "cluster",  "random"],
 				default="kt",
 		)
+		p.add_argument(
+		    "--test_sort_by",
+		    choices=["pt", "eta", "phi", "delta_R", "kt", "morton", "cluster", "random"],
+		    nargs="+",
+		    default=None,
+		    help="One or more test-time orderings to evaluate. Defaults to --sort_by."
+		)
 		p.add_argument("--batch_size", type=int, default=4096)
 		p.add_argument("--val_split", type=float, default=0.2)
 		p.add_argument("--num_particles_truncate", type=int, default=None,
@@ -359,6 +366,8 @@ def parse_args():
 
 def main():
 		args = parse_args()
+
+		test_sorts = args.test_sort_by if args.test_sort_by is not None else [args.sort_by]
 
 		# pick num_particles & output_dim
 		if args.dataset == "jetclass":
@@ -630,18 +639,22 @@ def main():
 		plt.close()
 
 		# final testing
-		run_testing(
-				model,
-				args.dataset,
-				args.data_dir,
-				save_dir,
-				args.sort_by,
-				args.batch_size,
-				num_particles_for_files,
-				morton_grid_size=args.morton_grid_size,
-				num_particles_truncate=args.num_particles_truncate,
-				enc_patch_sizes=enc_patch_sizes,
-		)
+		for test_sort in test_sorts:
+		    logging.info("=" * 60)
+		    logging.info("TEST ORDERING: %s", test_sort)
+		    logging.info("=" * 60)
+		    run_testing(
+		        model,
+		        args.dataset,
+		        args.data_dir,
+		        save_dir,
+		        test_sort,          # ← single string each iteration
+		        args.batch_size,
+		        num_particles_for_files,
+		        morton_grid_size=args.morton_grid_size,
+		        num_particles_truncate=args.num_particles_truncate,
+		        enc_patch_sizes=enc_patch_sizes,
+		    )
 
 
 if __name__ == "__main__":
