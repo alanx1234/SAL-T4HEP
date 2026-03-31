@@ -115,18 +115,15 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
     if dataset == "jetclass":
         x_test = x_test.transpose(0, 2, 1)
 
-    # sorting for test
     x_test = apply_sorting(x_test, sort_by)
     logging.info("Applied '%s' sorting to TEST set", sort_by)
 
-    # flops & macs
     num_p, feat_d = x_test.shape[1], x_test.shape[2]
     flops = get_flops(model, (1, num_p, feat_d))
     macs = flops // 2
     logging.info("FLOPs per inference: %d", flops)
     logging.info("MACs per inference: %d", macs)
 
-    # timing
     _ = model.predict(x_test[:batch_size], batch_size=batch_size)
     times = []
     for _ in range(20):
@@ -136,11 +133,9 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
     avg_ns = np.mean(times) / batch_size * 1e9
     logging.info("Avg inference time/event: %.2f ns", avg_ns)
 
-    # GPU memory
     curr, peak = profile_gpu_memory_during_inference(model, x_test[:batch_size])
     logging.info("GPU memory current: %.1f MB, peak: %.1f MB", curr, peak)
 
-    # metrics
     preds = model.predict(x_test, batch_size=batch_size)
     if dataset == "top" or dataset == "QG":
         acc = accuracy_score(y_test, (preds.ravel() > 0.5).astype(int))
@@ -150,12 +145,11 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
         auc_m = roc_auc_score(y_test, preds, average="macro", multi_class="ovo")
     logging.info("Test Accuracy: %.4f, ROC AUC: %.4f", acc, auc_m)
 
-    # ROC curves and labels
     if dataset == "hls4ml":
         labels = ["q", "g", "W", "Z", "t"]
     elif dataset == "top":
         labels = ["qcd", "top"]
-    elif dataset == "QG":  # gluon is 0 and quark is 1.
+    elif dataset == "QG":
         labels = ["Gluon", "Quark"]
     else:
         labels = [f"label_{i}" for i in range(preds.shape[1])]
@@ -206,13 +200,14 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--val_split", type=float, default=0.2)
     p.add_argument("--dropout", type=float, default=0.3)
+    p.add_argument("--base_width", type=int, default=16,
+                   help="Base channel width for PointNet. Default 16 matches original. Use 20 for ~1.3M FLOPs.")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # pick num_particles & output_dim
     if args.dataset == "jetclass":
         num_particles = 150
         output_dim = 10
@@ -230,7 +225,6 @@ def main():
         output_dim = 5
         loss_fn = "categorical_crossentropy"
 
-    # prepare save directory
     save_dir = os.path.join(args.save_dir, str(num_particles), args.sort_by)
     trial = 0
     while True:
@@ -250,7 +244,6 @@ def main():
     )
     logging.info("Args: %s", args)
 
-    # load train/val
     if args.dataset == "hls4ml":
         x = np.load(
             os.path.join(
@@ -265,7 +258,7 @@ def main():
         x_train, x_val, y_train, y_val = train_test_split(
             x, y, test_size=args.val_split, random_state=42
         )
-    else:  # jetclass, top, or QG
+    else:
         x_train = np.load(os.path.join(args.data_dir, "train/features.npy"))
         y_train = np.load(os.path.join(args.data_dir, "train/labels.npy"))
         x_val = np.load(os.path.join(args.data_dir, "val/features.npy"))
@@ -277,13 +270,9 @@ def main():
 
     logging.info(
         "Loaded train x=%s y=%s, val x=%s y=%s",
-        x_train.shape,
-        y_train.shape,
-        x_val.shape,
-        y_val.shape,
+        x_train.shape, y_train.shape, x_val.shape, y_val.shape,
     )
 
-    # apply sorting
     x_train = apply_sorting(x_train, args.sort_by)
     x_val = apply_sorting(x_val, args.sort_by)
 
@@ -293,6 +282,7 @@ def main():
         feature_dim=x_train.shape[2],
         output_dim=output_dim,
         dropout_rate=args.dropout,
+        base_width=args.base_width,
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(),
@@ -302,7 +292,6 @@ def main():
     model.summary(print_fn=lambda l: logging.info(l))
     logging.info("Total params: %d", model.count_params())
 
-    # callbacks
     ckpt = ModelCheckpoint(
         os.path.join(save_dir, "best.weights.h5"),
         monitor="val_loss",
@@ -313,7 +302,6 @@ def main():
         monitor="val_loss", patience=40, restore_best_weights=True, verbose=1
     )
 
-    # training schedule (kept conservative)
     schedule = [
         (128, 200),
         (256, 200),
@@ -321,15 +309,14 @@ def main():
         (1024, 200),
         (2048, 200),
         (4096, 400),
-    	]
+    ]
 
     ce = 0
     histories = []
     for bs, ep in schedule:
         tf.keras.backend.set_value(model.optimizer.lr, 1e-3)
         hist = model.fit(
-            x_train,
-            y_train,
+            x_train, y_train,
             validation_data=(x_val, y_val),
             initial_epoch=ce,
             epochs=ce + ep,
@@ -340,7 +327,6 @@ def main():
         histories.append(hist)
         ce += ep
 
-    # save weights and metrics
     model.save_weights(os.path.join(save_dir, "model.weights.h5"))
     train_loss = np.concatenate([h.history["loss"] for h in histories])
     val_loss = np.concatenate([h.history["val_loss"] for h in histories])
@@ -351,13 +337,10 @@ def main():
     np.save(os.path.join(save_dir, "train_accuracy.npy"), train_acc)
     np.save(os.path.join(save_dir, "val_accuracy.npy"), val_acc)
 
-    # plot loss and accuracy
     plt.figure()
     plt.plot(train_loss, label="Train Loss")
     plt.plot(val_loss, label="Val Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "loss_curve.png"))
     plt.close()
@@ -365,26 +348,16 @@ def main():
     plt.figure()
     plt.plot(train_acc, label="Train Acc")
     plt.plot(val_acc, label="Val Acc")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend()
+    plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "accuracy_curve.png"))
     plt.close()
 
-    # final testing
     run_testing(
-        model,
-        args.dataset,
-        args.data_dir,
-        save_dir,
-        args.sort_by,
-        args.batch_size,
-        num_particles,
+        model, args.dataset, args.data_dir,
+        save_dir, args.sort_by, args.batch_size, num_particles,
     )
 
 
 if __name__ == "__main__":
     main()
-
-
