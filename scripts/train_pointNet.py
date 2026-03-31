@@ -292,6 +292,14 @@ def main():
     model.summary(print_fn=lambda l: logging.info(l))
     logging.info("Total params: %d", model.count_params())
 
+    # log FLOPs right after compile so we can verify config
+    flops = get_flops(model, (1, num_particles, x_train.shape[2]))
+    macs = flops // 2
+    logging.info("FLOPs per inference: %d", flops)
+    logging.info("MACs per inference: %d", macs)
+    print(f"FLOPs per inference: {flops}")
+    print(f"MACs  per inference: {macs}")
+
     ckpt = ModelCheckpoint(
         os.path.join(save_dir, "best.weights.h5"),
         monitor="val_loss",

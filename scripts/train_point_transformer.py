@@ -327,11 +327,11 @@ def parse_args():
 				help="If set, truncate to this many particles after sorting (e.g. 64 to keep top-64 by pt)")
 
 		# Model hyperparameters
-		p.add_argument("--enc_dims", type=int, nargs="+", default=[12, 24, 32])
-		p.add_argument("--enc_layers", type=int, nargs="+", default=[1, 1, 1])
-		p.add_argument("--enc_heads", type=int, nargs="+", default=[4, 4, 4])
+		p.add_argument("--enc_dims", type=int, nargs="+", default=None)
+		p.add_argument("--enc_layers", type=int, nargs="+", default=None)
+		p.add_argument("--enc_heads", type=int, nargs="+", default=None)
 		p.add_argument("--enc_patch_sizes", type=int, nargs="+", default=None)
-		p.add_argument("--enc_strides", type=int, nargs="+", default=[2, 2])
+		p.add_argument("--enc_strides", type=int, nargs="+", default=None)
 		p.add_argument("--cpe_k", type=int, default=8)
 		p.add_argument("--grid_size", type=float, default=0.05, help="GeometricCPE grid size (coarser -> smaller grid)")
 		p.add_argument("--morton_grid_size", type=float, default=0.05, help="Grid size for morton sorting (separate from GeometricCPE grid_size)")
@@ -456,7 +456,7 @@ def main():
 		else:
 				num_particles_for_files = num_particles
 
-		# select preset
+		# select preset — CLI args take priority over preset defaults
 		presets = {
 			"small":  dict(enc_dims=[16], enc_layers=[1], enc_heads=[4], enc_strides=[2], enc_patch_sizes=[25], cpe_k=8, use_rpe=False),
 			"small_2layer_no_downsamp": dict(enc_dims=[16, 16], enc_layers=[1, 1], enc_heads=[4, 4], enc_strides=[1, 1], enc_patch_sizes=[25, 25], cpe_k=8, use_rpe=False),
@@ -466,11 +466,12 @@ def main():
     		"large":  dict(enc_dims=[16, 24, 32], enc_layers=[1, 1, 1], enc_heads=[4, 4, 4], enc_strides=[2, 2], enc_patch_sizes=[25, 25, 25], cpe_k=8, use_rpe=False),
     	}
 		cfg = presets[args.model_size]
-		enc_dims = cfg["enc_dims"]
-		enc_layers = cfg["enc_layers"]
-		enc_heads = cfg["enc_heads"]
-		enc_strides = cfg["enc_strides"]
-		enc_patch_sizes = cfg["enc_patch_sizes"] if args.enc_patch_sizes is None else args.enc_patch_sizes
+		# CLI args (default=None) override preset; fall back to preset only when not specified
+		enc_dims        = args.enc_dims        if args.enc_dims        is not None else cfg["enc_dims"]
+		enc_layers      = args.enc_layers      if args.enc_layers      is not None else cfg["enc_layers"]
+		enc_heads       = args.enc_heads       if args.enc_heads       is not None else cfg["enc_heads"]
+		enc_strides     = args.enc_strides     if args.enc_strides     is not None else cfg["enc_strides"]
+		enc_patch_sizes = args.enc_patch_sizes if args.enc_patch_sizes is not None else cfg["enc_patch_sizes"]
 		n_stages = len(enc_dims)
 		if len(enc_patch_sizes) == 1 and n_stages > 1:
 		    enc_patch_sizes = enc_patch_sizes * n_stages  # broadcast single value
@@ -559,6 +560,15 @@ def main():
 		model.summary(print_fn=lambda l: logging.info(l))
 		logging.info("Total params: %d", model.count_params())
 
+		# ── log FLOPs right after compile so we can verify config ──────────────
+		flops = get_flops(model, (1, num_particles, x_train.shape[2]))
+		macs = flops // 2
+		logging.info("FLOPs per inference: %d", flops)
+		logging.info("MACs per inference: %d", macs)
+		print(f"FLOPs per inference: {flops}")
+		print(f"MACs  per inference: {macs}")
+		# ────────────────────────────────────────────────────────────────────────
+
 		# callbacks
 		ckpt = ModelCheckpoint(
 				os.path.join(save_dir, "best.weights.h5"),
@@ -570,24 +580,14 @@ def main():
 				monitor="val_loss", patience=40, restore_best_weights=True, verbose=1
 		)
 
-		if args.cpe_coord_mode == "pt":
-		    schedule = [
-		        (128, 200),
-		        (256, 200),
-		        (512, 200),
-		        (1024, 200),
-		        (2048, 200),
-		        (2048, 400),
-		    ]
-		else:
-		    schedule = [
-		        (128, 200),
-		        (256, 200),
-		        (512, 200),
-		        (1024, 200),
-		        (2048, 200),
-		        (2048, 400),
-		    ]
+		schedule = [
+		    (128, 200),
+		    (256, 200),
+		    (512, 200),
+		    (1024, 200),
+		    (2048, 200),
+		    (2048, 400),
+		]
 
 		ce = 0
 		histories = []
@@ -648,7 +648,7 @@ def main():
 		        args.dataset,
 		        args.data_dir,
 		        save_dir,
-		        test_sort,          # ← single string each iteration
+		        test_sort,
 		        args.batch_size,
 		        num_particles_for_files,
 		        morton_grid_size=args.morton_grid_size,
