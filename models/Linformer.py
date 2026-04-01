@@ -380,9 +380,9 @@ def build_linformer_transformer_classifier(
     
     if use_cpe:
         if use_cpe:
-        pt  = inputs[..., 0]   
-        eta = inputs[..., 1]
-        phi = inputs[..., 2]
+            pt  = inputs[..., 0]   
+            eta = inputs[..., 1]
+            phi = inputs[..., 2]
         x = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size)(x, pt, eta, phi)
 
     x = LinformerTransformerBlock(
