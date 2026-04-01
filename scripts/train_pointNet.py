@@ -200,8 +200,17 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--val_split", type=float, default=0.2)
     p.add_argument("--dropout", type=float, default=0.3)
-    p.add_argument("--base_width", type=int, default=16,
-                   help="Base channel width for PointNet. Default 16 matches original. Use 20 for ~1.3M FLOPs.")
+    p.add_argument(
+        "--base_width",
+        type=int,
+        default=16,
+        help="Base channel width for PointNet. Default 16 matches original. Use 20 for ~1.3M FLOPs.",
+    )
+    p.add_argument(
+        "--flops_only",
+        action="store_true",
+        help="Build model, report FLOPs, then exit",
+    )
     return p.parse_args()
 
 
@@ -299,6 +308,9 @@ def main():
     logging.info("MACs per inference: %d", macs)
     print(f"FLOPs per inference: {flops}")
     print(f"MACs  per inference: {macs}")
+
+    if args.flops_only:
+        return
 
     ckpt = ModelCheckpoint(
         os.path.join(save_dir, "best.weights.h5"),
