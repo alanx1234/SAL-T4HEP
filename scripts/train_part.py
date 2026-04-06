@@ -127,8 +127,8 @@ def load_test_data(dataset, data_dir, num_particles):
         x = np.load(os.path.join(data_dir, f"x_val_robust_{num_particles}const_ptetaphi.npy"))
         y = np.load(os.path.join(data_dir, f"y_val_robust_{num_particles}const_ptetaphi.npy"))
     elif dataset == "jetclass":
-        x = np.load(os.path.join(data_dir, "JetClass/kinematics/test/features.npy"))
-        y = np.load(os.path.join(data_dir, "JetClass/kinematics/test/labels.npy"))
+        x = np.load(os.path.join(data_dir, "test/features.npy"))
+        y = np.load(os.path.join(data_dir, "test/labels.npy"))
         x = x.transpose(0, 2, 1)
     elif dataset == "top":
         x = np.load(os.path.join(data_dir, "test/features.npy"))
