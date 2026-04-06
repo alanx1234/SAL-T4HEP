@@ -353,6 +353,7 @@ def main():
             output_dim=args.output_dim,
             num_heads=args.num_heads,
             convolution=args.convolution,
+            use_attention_mask=False,
         )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(),
