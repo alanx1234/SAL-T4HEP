@@ -1,19 +1,24 @@
 #!/usr/bin/env python
 """
-Sweep ParT (Particle Transformer) configs to find one near ~1.3M FLOPs.
-Uses the EXACT same profiling methodology as benchmark_pytorch_models.py
-and scan_proj_dim.py for apples-to-apples comparison with SAL-T/Linformer.
+Sweep ParT configs to find one near ~1.3M FLOPs.
+Uses weaver-core's flops_counter INLINED (no weaver dependency).
+The counter reports MACs ≡ FLOPs (same unit as TF profiler).
 
 Place in: SAL-T4HEP/scripts/inspect_part.py
-Requires: SAL-T4HEP/models/parT.py (with networks.logger stub)
+
+Usage:
+  python inspect_part.py --target_flops 1300000 --num_particles 150 --num_classes 10
 """
 import os
 import sys
+import copy
 import argparse
-import time
+import logging
+from functools import partial
+
 import numpy as np
 import torch
-from torch.profiler import profile, ProfilerActivity
+import torch.nn as nn
 
 # ─── make project root importable ─────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,80 +28,457 @@ if PROJECT_ROOT not in sys.path:
 
 from models.parT import ParticleTransformer
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# INLINED: weaver/utils/flops_counter.py  (MIT License, Sovrasov V. / Huilin Qu)
+# https://github.com/hqucms/weaver-core/blob/main/weaver/utils/flops_counter.py
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def num_params(model):
+_fc_logger = logging.getLogger("flops_counter")
+
+
+def get_model_complexity_info(model, inputs,
+                              print_per_layer_stat=True,
+                              as_strings=True,
+                              ost=sys.stdout,
+                              verbose=False, ignore_modules=[],
+                              custom_modules_hooks={}):
+    assert isinstance(model, nn.Module)
+    global CUSTOM_MODULES_MAPPING
+    CUSTOM_MODULES_MAPPING = custom_modules_hooks
+    flops_model = _add_flops_counting_methods(model)
+    flops_model.eval()
+    flops_model.start_flops_count(ost=ost, verbose=verbose,
+                                  ignore_list=ignore_modules)
+    _ = flops_model(*inputs)
+    flops_count, params_count = flops_model.compute_average_flops_cost()
+    if print_per_layer_stat:
+        _print_model_with_flops(flops_model, flops_count, params_count, ost=ost)
+    flops_model.stop_flops_count()
+    CUSTOM_MODULES_MAPPING = {}
+    if as_strings:
+        return _flops_to_string(flops_count), _params_to_string(params_count)
+    return flops_count, params_count
+
+
+def _flops_to_string(flops, units=None, precision=2):
+    if units is None:
+        if flops // 10**9 > 0:
+            return str(round(flops / 10.**9, precision)) + ' GMac'
+        elif flops // 10**6 > 0:
+            return str(round(flops / 10.**6, precision)) + ' MMac'
+        elif flops // 10**3 > 0:
+            return str(round(flops / 10.**3, precision)) + ' KMac'
+        else:
+            return str(flops) + ' Mac'
+    else:
+        if units == 'GMac':
+            return str(round(flops / 10.**9, precision)) + ' ' + units
+        elif units == 'MMac':
+            return str(round(flops / 10.**6, precision)) + ' ' + units
+        elif units == 'KMac':
+            return str(round(flops / 10.**3, precision)) + ' ' + units
+        else:
+            return str(flops) + ' Mac'
+
+
+def _params_to_string(params_num, units=None, precision=2):
+    if units is None:
+        if params_num // 10 ** 6 > 0:
+            return str(round(params_num / 10 ** 6, 2)) + ' M'
+        elif params_num // 10 ** 3:
+            return str(round(params_num / 10 ** 3, 2)) + ' k'
+        else:
+            return str(params_num)
+    else:
+        if units == 'M':
+            return str(round(params_num / 10.**6, precision)) + ' ' + units
+        elif units == 'K':
+            return str(round(params_num / 10.**3, precision)) + ' ' + units
+        else:
+            return str(params_num)
+
+
+def _accumulate_flops(self):
+    if _is_supported_instance(self):
+        return self.__flops__
+    else:
+        s = 0
+        for m in self.children():
+            s += m.accumulate_flops()
+        return s
+
+
+def _print_model_with_flops(model, total_flops, total_params, units=None,
+                             precision=3, ost=sys.stdout):
+    if total_flops < 1:
+        total_flops = 1
+
+    def accumulate_params(self):
+        if _is_supported_instance(self):
+            return self.__params__
+        else:
+            s = 0
+            for m in self.children():
+                s += m.accumulate_params()
+            return s
+
+    def flops_repr(self):
+        accumulated_params_num = self.accumulate_params()
+        accumulated_flops_cost = self.accumulate_flops() / model.__batch_counter__
+        prefix = self.original_extra_repr() + ', |' if self.original_extra_repr() else '|'
+        return prefix + ', '.join([
+            _params_to_string(accumulated_params_num, units='M', precision=precision),
+            '{:.3%} Params'.format(accumulated_params_num / total_params),
+            _flops_to_string(accumulated_flops_cost, units=units, precision=precision),
+            '{:.3%} MACs'.format(accumulated_flops_cost / total_flops)]) + '|'
+
+    def add_extra_repr(m):
+        m.accumulate_flops = _accumulate_flops.__get__(m)
+        m.accumulate_params = accumulate_params.__get__(m)
+        flops_extra_repr = flops_repr.__get__(m)
+        if m.extra_repr != flops_extra_repr:
+            m.original_extra_repr = m.extra_repr
+            m.extra_repr = flops_extra_repr
+            assert m.extra_repr != m.original_extra_repr
+
+    def del_extra_repr(m):
+        if hasattr(m, 'original_extra_repr'):
+            m.extra_repr = m.original_extra_repr
+            del m.original_extra_repr
+        if hasattr(m, 'accumulate_flops'):
+            del m.accumulate_flops
+
+    model.apply(add_extra_repr)
+    print(repr(model), file=ost)
+    model.apply(del_extra_repr)
+
+
+def _get_model_parameters_number(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def measure(model, x, v, mask, warmup=5, iters=20, device="cuda"):
+def _add_flops_counting_methods(net_main_module):
+    net_main_module.start_flops_count = _start_flops_count.__get__(net_main_module)
+    net_main_module.stop_flops_count = _stop_flops_count.__get__(net_main_module)
+    net_main_module.reset_flops_count = _reset_flops_count.__get__(net_main_module)
+    net_main_module.compute_average_flops_cost = _compute_average_flops_cost.__get__(net_main_module)
+    net_main_module.reset_flops_count()
+    return net_main_module
+
+
+def _compute_average_flops_cost(self):
+    for m in self.modules():
+        m.accumulate_flops = _accumulate_flops.__get__(m)
+    flops_sum = self.accumulate_flops()
+    for m in self.modules():
+        if hasattr(m, 'accumulate_flops'):
+            del m.accumulate_flops
+    params_sum = _get_model_parameters_number(self)
+    return flops_sum / self.__batch_counter__, params_sum
+
+
+def _start_flops_count(self, **kwargs):
+    _add_batch_counter_hook_function(self)
+    seen_types = set()
+
+    def add_flops_counter_hook_function(module, ost, verbose, ignore_list):
+        if type(module) in ignore_list:
+            seen_types.add(type(module))
+            if _is_supported_instance(module):
+                module.__params__ = 0
+        elif _is_supported_instance(module):
+            if hasattr(module, '__flops_handle__'):
+                return
+            if type(module) in CUSTOM_MODULES_MAPPING:
+                handle = module.register_forward_hook(CUSTOM_MODULES_MAPPING[type(module)])
+            else:
+                handle = module.register_forward_hook(MODULES_MAPPING[type(module)])
+            module.__flops_handle__ = handle
+            seen_types.add(type(module))
+        else:
+            if verbose and type(module) not in (nn.Sequential, nn.ModuleList) and \
+               type(module) not in seen_types:
+                _fc_logger.info('Warning: module %s is treated as a zero-op.', type(module).__name__)
+            seen_types.add(type(module))
+
+    self.apply(partial(add_flops_counter_hook_function, **kwargs))
+
+
+def _stop_flops_count(self):
+    _remove_batch_counter_hook_function(self)
+    self.apply(_remove_flops_counter_hook_function)
+
+
+def _reset_flops_count(self):
+    _add_batch_counter_variables_or_reset(self)
+    self.apply(_add_flops_counter_variable_or_reset)
+
+
+# ── Hook functions ────────────────────────────────────────────────────────────
+
+def _empty_flops_counter_hook(module, input, output):
+    module.__flops__ += 0
+
+
+def _relu_flops_counter_hook(module, input, output):
+    module.__flops__ += int(output.numel())
+
+
+def _linear_flops_counter_hook(module, input, output):
+    inp = input[0]
+    output_last_dim = output.shape[-1]
+    bias_flops = output_last_dim if module.bias is not None else 0
+    module.__flops__ += int(np.prod(inp.shape) * output_last_dim + bias_flops)
+
+
+def _pool_flops_counter_hook(module, input, output):
+    inp = input[0]
+    module.__flops__ += int(np.prod(inp.shape))
+
+
+def _bn_flops_counter_hook(module, input, output):
+    inp = input[0]
+    batch_flops = np.prod(inp.shape)
+    if module.affine:
+        batch_flops *= 2
+    module.__flops__ += int(batch_flops)
+
+
+def _conv_flops_counter_hook(conv_module, input, output):
+    inp = input[0]
+    batch_size = inp.shape[0]
+    output_dims = list(output.shape[2:])
+    kernel_dims = list(conv_module.kernel_size)
+    in_channels = conv_module.in_channels
+    out_channels = conv_module.out_channels
+    groups = conv_module.groups
+    filters_per_channel = out_channels // groups
+    conv_per_position_flops = int(np.prod(kernel_dims)) * in_channels * filters_per_channel
+    active_elements_count = batch_size * int(np.prod(output_dims))
+    overall_conv_flops = conv_per_position_flops * active_elements_count
+    bias_flops = 0
+    if conv_module.bias is not None:
+        bias_flops = out_channels * active_elements_count
+    conv_module.__flops__ += int(overall_conv_flops + bias_flops)
+
+
+def _upsample_flops_counter_hook(module, input, output):
+    output_size = output[0]
+    batch_size = output_size.shape[0]
+    output_elements_count = batch_size
+    for val in output_size.shape[1:]:
+        output_elements_count *= val
+    module.__flops__ += int(output_elements_count)
+
+
+def _multihead_attention_counter_hook(multihead_attention_module, input, output):
+    flops = 0
+    q, k, v = input
+    batch_size = q.shape[1]
+    num_heads = multihead_attention_module.num_heads
+    embed_dim = multihead_attention_module.embed_dim
+    kdim = multihead_attention_module.kdim
+    vdim = multihead_attention_module.vdim
+    if kdim is None:
+        kdim = embed_dim
+    if vdim is None:
+        vdim = embed_dim
+    # initial projections
+    flops = q.shape[0] * q.shape[2] * embed_dim + \
+        k.shape[0] * k.shape[2] * kdim + \
+        v.shape[0] * v.shape[2] * vdim
+    if multihead_attention_module.in_proj_bias is not None:
+        flops += (q.shape[0] + k.shape[0] + v.shape[0]) * embed_dim
+    # attention heads: scale, matmul, softmax, matmul
+    head_dim = embed_dim // num_heads
+    head_flops = q.shape[0] * head_dim + \
+        head_dim * q.shape[0] * k.shape[0] + \
+        q.shape[0] * k.shape[0] + \
+        q.shape[0] * k.shape[0] * head_dim
+    flops += num_heads * head_flops
+    # final projection, bias is always enabled
+    flops += q.shape[0] * embed_dim * (embed_dim + 1)
+    flops *= batch_size
+    multihead_attention_module.__flops__ += int(flops)
+
+
+def _batch_counter_hook(module, input, output):
+    batch_size = 1
+    if len(input) > 0:
+        inp = input[0]
+        batch_size = len(inp)
+    module.__batch_counter__ += batch_size
+
+
+def _rnn_flops(flops, rnn_module, w_ih, w_hh, input_size):
+    flops += w_ih.shape[0] * w_ih.shape[1]
+    flops += w_hh.shape[0] * w_hh.shape[1]
+    if isinstance(rnn_module, (nn.RNN, nn.RNNCell)):
+        flops += rnn_module.hidden_size
+    elif isinstance(rnn_module, (nn.GRU, nn.GRUCell)):
+        flops += rnn_module.hidden_size
+        flops += rnn_module.hidden_size * 3
+        flops += rnn_module.hidden_size * 3
+    elif isinstance(rnn_module, (nn.LSTM, nn.LSTMCell)):
+        flops += rnn_module.hidden_size * 4
+        flops += rnn_module.hidden_size * 3
+        flops += rnn_module.hidden_size * 3
+    return flops
+
+
+def _rnn_flops_counter_hook(rnn_module, input, output):
+    flops = 0
+    inp = input[0]
+    batch_size = inp.shape[0]
+    seq_length = inp.shape[1]
+    num_layers = rnn_module.num_layers
+    for i in range(num_layers):
+        w_ih = rnn_module.__getattr__('weight_ih_l' + str(i))
+        w_hh = rnn_module.__getattr__('weight_hh_l' + str(i))
+        if i == 0:
+            input_size = rnn_module.input_size
+        else:
+            input_size = rnn_module.hidden_size
+        flops = _rnn_flops(flops, rnn_module, w_ih, w_hh, input_size)
+        if rnn_module.bias:
+            b_ih = rnn_module.__getattr__('bias_ih_l' + str(i))
+            b_hh = rnn_module.__getattr__('bias_hh_l' + str(i))
+            flops += b_ih.shape[0] + b_hh.shape[0]
+    flops *= batch_size
+    flops *= seq_length
+    if rnn_module.bidirectional:
+        flops *= 2
+    rnn_module.__flops__ += int(flops)
+
+
+def _rnn_cell_flops_counter_hook(rnn_cell_module, input, output):
+    flops = 0
+    inp = input[0]
+    batch_size = inp.shape[0]
+    w_ih = rnn_cell_module.__getattr__('weight_ih')
+    w_hh = rnn_cell_module.__getattr__('weight_hh')
+    input_size = inp.shape[1]
+    flops = _rnn_flops(flops, rnn_cell_module, w_ih, w_hh, input_size)
+    if rnn_cell_module.bias:
+        b_ih = rnn_cell_module.__getattr__('bias_ih')
+        b_hh = rnn_cell_module.__getattr__('bias_hh')
+        flops += b_ih.shape[0] + b_hh.shape[0]
+    flops *= batch_size
+    rnn_cell_module.__flops__ += int(flops)
+
+
+# ── Batch counter helpers ─────────────────────────────────────────────────────
+
+def _add_batch_counter_variables_or_reset(module):
+    module.__batch_counter__ = 0
+
+
+def _add_batch_counter_hook_function(module):
+    if hasattr(module, '__batch_counter_handle__'):
+        return
+    handle = module.register_forward_hook(_batch_counter_hook)
+    module.__batch_counter_handle__ = handle
+
+
+def _remove_batch_counter_hook_function(module):
+    if hasattr(module, '__batch_counter_handle__'):
+        module.__batch_counter_handle__.remove()
+        del module.__batch_counter_handle__
+
+
+def _add_flops_counter_variable_or_reset(module):
+    if _is_supported_instance(module):
+        if hasattr(module, '__flops__') or hasattr(module, '__params__'):
+            pass
+        module.__flops__ = 0
+        module.__params__ = _get_model_parameters_number(module)
+
+
+# ── Module mapping ────────────────────────────────────────────────────────────
+
+CUSTOM_MODULES_MAPPING = {}
+
+MODULES_MAPPING = {
+    nn.Conv1d: _conv_flops_counter_hook,
+    nn.Conv2d: _conv_flops_counter_hook,
+    nn.Conv3d: _conv_flops_counter_hook,
+    nn.ReLU: _relu_flops_counter_hook,
+    nn.PReLU: _relu_flops_counter_hook,
+    nn.ELU: _relu_flops_counter_hook,
+    nn.LeakyReLU: _relu_flops_counter_hook,
+    nn.ReLU6: _relu_flops_counter_hook,
+    nn.MaxPool1d: _pool_flops_counter_hook,
+    nn.AvgPool1d: _pool_flops_counter_hook,
+    nn.AvgPool2d: _pool_flops_counter_hook,
+    nn.MaxPool2d: _pool_flops_counter_hook,
+    nn.MaxPool3d: _pool_flops_counter_hook,
+    nn.AvgPool3d: _pool_flops_counter_hook,
+    nn.AdaptiveMaxPool1d: _pool_flops_counter_hook,
+    nn.AdaptiveAvgPool1d: _pool_flops_counter_hook,
+    nn.AdaptiveMaxPool2d: _pool_flops_counter_hook,
+    nn.AdaptiveAvgPool2d: _pool_flops_counter_hook,
+    nn.AdaptiveMaxPool3d: _pool_flops_counter_hook,
+    nn.AdaptiveAvgPool3d: _pool_flops_counter_hook,
+    nn.BatchNorm1d: _bn_flops_counter_hook,
+    nn.BatchNorm2d: _bn_flops_counter_hook,
+    nn.BatchNorm3d: _bn_flops_counter_hook,
+    nn.Linear: _linear_flops_counter_hook,
+    nn.Upsample: _upsample_flops_counter_hook,
+    nn.ConvTranspose1d: _conv_flops_counter_hook,
+    nn.ConvTranspose2d: _conv_flops_counter_hook,
+    nn.ConvTranspose3d: _conv_flops_counter_hook,
+    nn.RNN: _rnn_flops_counter_hook,
+    nn.GRU: _rnn_flops_counter_hook,
+    nn.LSTM: _rnn_flops_counter_hook,
+    nn.RNNCell: _rnn_cell_flops_counter_hook,
+    nn.LSTMCell: _rnn_cell_flops_counter_hook,
+    nn.GRUCell: _rnn_cell_flops_counter_hook,
+    nn.MultiheadAttention: _multihead_attention_counter_hook,
+}
+
+
+def _is_supported_instance(module):
+    if type(module) in MODULES_MAPPING or type(module) in CUSTOM_MODULES_MAPPING:
+        return True
+    return False
+
+
+def _remove_flops_counter_hook_function(module):
+    if _is_supported_instance(module):
+        if hasattr(module, '__flops_handle__'):
+            module.__flops_handle__.remove()
+            del module.__flops_handle__
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# END INLINED flops_counter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def measure_flops(model, num_particles, pair_input_dim):
     """
-    Measure FLOPs, timing, and peak memory.
-    Matches benchmark_pytorch_models.py methodology exactly.
+    Returns (FLOPs, params) using weaver's counter.
+    FLOPs here = MACs = same unit as TF profiler "FLOPs".
     """
+    model = copy.deepcopy(model)
     model.eval()
-    model.to(device)
-    x = x.to(device)
-    v = v.to(device) if v is not None else None
-    mask = mask.to(device)
 
-    # warmup
-    for _ in range(warmup):
-        with torch.inference_mode():
-            _ = model(x, v=v, mask=mask)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    x = torch.ones(1, 3, num_particles, dtype=torch.float32)
+    v = torch.ones(1, 4, num_particles, dtype=torch.float32) if pair_input_dim > 0 else None
+    mask = torch.ones(1, 1, num_particles, dtype=torch.float32)
+    inputs = (x, v, mask)
 
-    # timing
-    times = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            _ = model(x, v=v, mask=mask)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        times.append(time.perf_counter() - t0)
-    avg_per_item_ns = (sum(times) / len(times)) / x.size(0) * 1e9
-
-    # peak memory
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-        with torch.inference_mode():
-            _ = model(x, v=v, mask=mask)
-        torch.cuda.synchronize()
-        peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
-    else:
-        peak_mb = 0.0
-
-    # FLOPs via profiler — exact same as benchmark_pytorch_models.py
-    total_flops = None
-    try:
-        import os as _os
-        from contextlib import redirect_stderr as _redirect_stderr
-        with open(_os.devnull, "w") as _devnull, _redirect_stderr(_devnull):
-            with profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                profile_memory=True,
-                with_flops=True,
-            ) as prof:
-                with torch.inference_mode():
-                    _ = model(x, v=v, mask=mask)
-        events = prof.key_averages()
-        flops = 0
-        for evt in events:
-            evt_flops = getattr(evt, "flops", None)
-            if isinstance(evt_flops, (int, float)):
-                flops += int(evt_flops)
-        total_flops = flops if flops > 0 else None
-    except Exception:
-        total_flops = None
-
-    return avg_per_item_ns, peak_mb, total_flops
+    flops, params = get_model_complexity_info(
+        model, inputs,
+        as_strings=False,
+        print_per_layer_stat=False,
+        verbose=False,
+    )
+    return flops, params
 
 
 def build_part(embed_dims, pair_embed_dims, num_heads, pair_input_dim,
-               num_layers=1, num_cls_layers=1, num_classes=10, num_particles=150):
-    """Build a ParT model with the given config."""
+               num_layers=1, num_cls_layers=1, num_classes=10):
     pe = pair_embed_dims if pair_embed_dims else None
     pid = pair_input_dim if pair_embed_dims else 0
 
@@ -128,27 +510,13 @@ def build_part(embed_dims, pair_embed_dims, num_heads, pair_input_dim,
     return model
 
 
-def make_dummy_inputs(batch_size, num_particles, pair_input_dim):
-    """Create dummy inputs matching ParT's expected format."""
-    x = torch.randn(batch_size, 3, num_particles)
-    v = torch.randn(batch_size, 4, num_particles) if pair_input_dim > 0 else None
-    mask = torch.ones(batch_size, 1, num_particles)
-    return x, v, mask
-
-
 def main():
     parser = argparse.ArgumentParser(description="Sweep ParT configs for target FLOPs")
-    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--num_particles", type=int, default=150)
     parser.add_argument("--num_classes", type=int, default=10, help="10 for jetclass, 5 for hls4ml")
-    parser.add_argument("--device", choices=["cuda", "cpu"],
-                        default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--target_flops", type=int, default=1_300_000)
-    parser.add_argument("--num_runs", type=int, default=5,
-                        help="Number of measurement runs for mean±std")
     args = parser.parse_args()
 
-    B = args.batch_size
     N = args.num_particles
     C = args.num_classes
     target = args.target_flops
@@ -171,59 +539,35 @@ def main():
         ([12], [4],    4, 4, "d12-h4-pe4"),
         ([16], None,   4, 0, "d16-h4-nopair"),
         ([16], None,   2, 0, "d16-h2-nopair"),
+        ([16], [4],    4, 4, "d16-h4-pe4"),
+        ([16], [8],    4, 4, "d16-h4-pe8"),
         ([8,8],  [4],  2, 4, "d8x8-h2-pe4"),
         ([12,8], [4],  2, 4, "d12x8-h2-pe4"),
     ]
 
-    print("=" * 100)
-    print(f"ParT FLOPs Sweep — target: ~{target:,}")
-    print(f"B={B}, N={N}, classes={C}, device={args.device}, runs={args.num_runs}")
-    print("=" * 100)
-    header = f"{'Config':<25} {'Params':>8} {'FLOPs':>14} {'ratio':>7} {'ns/evt':>10} {'peakMB':>8}"
-    print(header)
-    print("-" * 100)
+    print("=" * 95)
+    print(f"ParT FLOPs Sweep (weaver flops_counter, inlined) — target: ~{target:,} FLOPs")
+    print(f"N={N}, classes={C}")
+    print("=" * 95)
+    print(f"{'Config':<25} {'Params':>8} {'FLOPs':>14} {'ratio':>8}")
+    print("-" * 95)
 
     for embed_dims, pe, nh, pid, name in configs:
         try:
-            model = build_part(embed_dims, pe, nh, pid,
-                               num_classes=C, num_particles=N)
-            pcount = num_params(model)
-            x, v, mask = make_dummy_inputs(B, N, pid)
+            model = build_part(embed_dims, pe, nh, pid, num_classes=C)
+            flops, params = measure_flops(model, N, pid)
 
-            # Multiple runs for stability
-            flops_list = []
-            times_list = []
-            mems_list = []
-            for _ in range(args.num_runs):
-                ns, mb, flops = measure(model, x, v, mask, device=args.device)
-                times_list.append(ns)
-                mems_list.append(mb)
-                if flops is not None:
-                    flops_list.append(flops)
-
-            if flops_list:
-                flops_mean = int(np.mean(flops_list))
-                flops_str = f"{flops_mean:,}"
-                ratio = flops_mean / target
-                ratio_str = f"{ratio:.2f}x"
-            else:
-                flops_str = "N/A"
-                ratio_str = "N/A"
-                ratio = 0
-
-            time_mean = np.mean(times_list)
-            mem_mean = np.mean(mems_list)
-
-            marker = " ✓" if isinstance(ratio, float) and 0.85 <= ratio <= 1.15 else ""
-            print(f"{name:<25} {pcount:>8,} {flops_str:>14} {ratio_str:>7} "
-                  f"{time_mean:>9.1f} {mem_mean:>7.1f}{marker}")
+            ratio = flops / target if flops > 0 else 0
+            marker = " <--" if 0.85 <= ratio <= 1.15 else ""
+            print(f"{name:<25} {params:>8,} {flops:>14,.0f} {ratio:>7.2f}x{marker}")
 
         except Exception as e:
+            import traceback
             print(f"{name:<25} FAILED: {e}")
+            traceback.print_exc()
 
-    print("=" * 100)
-    print(f"Target: ~{target:,} FLOPs. Configs marked ✓ are within 85-115% of target.")
-    print("Use --num_classes 5 for hls4ml dataset comparison.")
+    print("=" * 95)
+    print(f"Target: ~{target:,} FLOPs. Configs marked <-- are within 85-115%.")
 
 
 if __name__ == "__main__":
