@@ -1,0 +1,100 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-jetclass-2m-kinematics-processing
+  namespace: cms-ml
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      containers:
+        - name: processing
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euxo pipefail
+
+              REPO_DIR="/tmp/sal_t_jetclass_processing"
+              REPO_REF="${REPO_REF:-iclr}"
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout "$REPO_REF"
+                git pull || true
+              else
+                git clone https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout "$REPO_REF"
+              fi
+
+              python3 -m pip install --no-cache-dir awkward uproot vector
+
+              RAW_DIR="${RAW_DIR:-/j-jepa-vol/linformer_data/JetClass}"
+              OUTPUT_DIR="${OUTPUT_DIR:-/j-jepa-vol/linformer_data/JetClass/kinematics_2m}"
+              mkdir -p "$OUTPUT_DIR"
+
+              test -f scripts/process_jetclass_kinematics.py
+              python3 -m py_compile scripts/process_jetclass_kinematics.py
+              test -d "$RAW_DIR/Pythia/train_100M"
+              test -d "$RAW_DIR/Pythia/val_5M"
+              test -d "$RAW_DIR/Pythia/test_20M"
+
+              python3 scripts/process_jetclass_kinematics.py \
+                --raw_dir "$RAW_DIR" \
+                --output_dir "$OUTPUT_DIR" \
+                --sample_type Pythia \
+                --feature_set ptetaphi \
+                --maxlen 150 \
+                --num_train 2000000 \
+                --num_val 200000 \
+                --num_test 1000000 \
+                --shuffle_seed 42 \
+                --shuffle_chunk_size 50000
+
+              python3 -c "import os, numpy as np; out='$OUTPUT_DIR'; \
+              [print(split, np.load(os.path.join(out, split, 'features.npy'), mmap_mode='r').shape, np.load(os.path.join(out, split, 'vectors.npy'), mmap_mode='r').shape, np.load(os.path.join(out, split, 'labels.npy'), mmap_mode='r').shape) for split in ('train', 'val', 'test')]"
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"

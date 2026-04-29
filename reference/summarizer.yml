@@ -1,0 +1,315 @@
+apiVersion: batch/v1
+kind: Job
+metadata: # may or may not be correctly formatting the YAML, but should be close enough for kubectl to parse. note that this is for a different setup. this is jsut a referenc esummarizer where I want the summarizing logic to be preserved (how each column of the table is computed and ordered). The only change subsequent ymls created from this reference should do is make the minimal adjustments needed (e.g. filepaths, 
+  name: alan-1p3m-summarize
+  namespace: cms-ml
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: summarize
+          image: python:3.11-slim
+          command: ["/bin/bash", "-lc"]
+          env:
+            - name: PYTHONIOENCODING
+              value: "utf-8"
+            - name: LC_ALL
+              value: "C.UTF-8"
+            - name: SAVE_BASE
+              value: "/j-jepa-vol/1p3m_FLOPs_runs"
+            - name: MODELS
+              value: "jedi_linear,transformer,ptv3_config1,ptv3_config2,ptv3_config3"
+            - name: TRIALS
+              value: "3"
+            - name: DEBUG
+              value: "1"
+          args:
+            - |
+              set -euo pipefail
+
+              cat > /tmp/summarize.py << 'PY'
+              #!/usr/bin/env python3
+              from __future__ import annotations
+              import os, re, math, glob, sys
+              sys.stdout.reconfigure(encoding="utf-8")
+              from pathlib import Path
+              from typing import Optional, Dict, Any, List
+              from collections import defaultdict
+
+              SAVE_BASE  = Path(os.environ.get("SAVE_BASE", "/j-jepa-vol/1p3m_FLOPs_runs"))
+              MODELS_ENV = os.environ.get("MODELS", "")
+              TRIALS     = int(os.environ.get("TRIALS", "3"))
+              DEBUG      = os.environ.get("DEBUG", "0") == "1"
+
+              if MODELS_ENV.strip():
+                  MODELS = [m.strip() for m in MODELS_ENV.split(",") if m.strip()]
+              else:
+                  MODELS = sorted([
+                      p.name for p in SAVE_BASE.iterdir()
+                      if p.is_dir() and not p.name.startswith("_")
+                  ])
+
+              JETCLASS_LABELS = [
+                  "label_QCD", "label_Hbb", "label_Hcc", "label_Hgg", "label_H4q",
+                  "label_Hqql", "label_Zqq", "label_Wqq", "label_Tbqq", "label_Tbl",
+              ]
+
+              TRAIN_LOG_GLOBS = ["train.log", "train*.log", "**/train.log", "**/train*.log"]
+
+              RX_TEST_ACC     = re.compile(r"Test\s*Accuracy:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
+              RX_ROC_AUC      = re.compile(r"ROC\s*AUC:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
+              RX_BR_W         = re.compile(r"Bg\s*rejection@0\.8\s*w:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
+              RX_BR_Z         = re.compile(r"Bg\s*rejection@0\.8\s*z:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
+              RX_BR_T         = re.compile(r"Bg\s*rejection@0\.8\s*t:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
+              RX_BR_GENERIC   = re.compile(r"Bg\s*rejection@0\.8\s*([A-Za-z]+)\s*:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
+              RX_TOTAL_PARAMS = re.compile(r"Total\s+params:\s*([0-9]+)", re.IGNORECASE)
+              RX_FLOPS        = re.compile(r"FLOPs\s*per\s*inference:\s*([0-9]+)", re.IGNORECASE)
+              RX_INV_FPR      = re.compile(r"1/FPR@0\.8\s+for\s+(\S+):\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
+
+              def find_newest_matching(run_dir, patterns):
+                  hits = []
+                  for pat in patterns:
+                      for h in glob.glob(str(run_dir / pat), recursive=True):
+                          p = Path(h)
+                          if p.is_file():
+                              hits.append(p)
+                  if not hits:
+                      return None
+                  hits.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                  return hits[0]
+
+              def last_float(rx, text):
+                  ms = rx.findall(text)
+                  if not ms: return None
+                  m = ms[-1]
+                  if isinstance(m, tuple): m = m[0]
+                  try: return float(m)
+                  except Exception: return None
+
+              def last_int(rx, text):
+                  ms = rx.findall(text)
+                  if not ms: return None
+                  m = ms[-1]
+                  if isinstance(m, tuple): m = m[0]
+                  try: return int(m)
+                  except Exception: return None
+
+              def sample_sd(xs):
+                  n = len(xs)
+                  if n <= 1: return 0.0
+                  mu = sum(xs) / n
+                  return math.sqrt(sum((x - mu) ** 2 for x in xs) / (n - 1))
+
+              def fmt_pm(xs, nd_mean, nd_sd):
+                  if not xs: return ""
+                  mu = sum(xs) / len(xs)
+                  sd = sample_sd(xs)
+                  return f"{mu:.{nd_mean}f} \u00B1 {sd:.{nd_sd}f}"
+
+              def is_jetclass_log(text):
+                  return any(lab.lower() in text.lower() for lab in JETCLASS_LABELS)
+
+              def parse_inv_fpr_per_class(text):
+                  result = {}
+                  for label, val in RX_INV_FPR.findall(text):
+                      try: result[label.lower()] = float(val)
+                      except Exception: pass
+                  return result
+
+              def parse_train_log(path):
+                  txt = path.read_text(errors="ignore")
+                  out = {}
+                  out["is_jetclass"]   = is_jetclass_log(txt)
+                  out["test_acc_frac"] = last_float(RX_TEST_ACC, txt)
+                  out["roc_auc"]       = last_float(RX_ROC_AUC, txt)
+                  out["params"]        = last_int(RX_TOTAL_PARAMS, txt)
+                  out["flops"]         = last_int(RX_FLOPS, txt)
+                  if out["is_jetclass"]:
+                      out["inv_fpr"] = parse_inv_fpr_per_class(txt)
+                  else:
+                      out["bg_rej_w"] = last_float(RX_BR_W, txt)
+                      out["bg_rej_z"] = last_float(RX_BR_Z, txt)
+                      out["bg_rej_t"] = last_float(RX_BR_T, txt)
+                      if out["bg_rej_w"] is None or out["bg_rej_z"] is None or out["bg_rej_t"] is None:
+                          g = {lab.lower(): float(val) for lab, val in RX_BR_GENERIC.findall(txt)}
+                          if out["bg_rej_w"] is None: out["bg_rej_w"] = g.get("w")
+                          if out["bg_rej_z"] is None: out["bg_rej_z"] = g.get("z")
+                          if out["bg_rej_t"] is None: out["bg_rej_t"] = g.get("t")
+                  return out
+
+              def collect_leaf_trial_dirs(model_dir):
+                  candidates = []
+                  for p in model_dir.rglob("trial-*"):
+                      if not p.is_dir(): continue
+                      if any(True for _ in p.glob("**/trial-*")): continue
+                      if any(Path(x).is_file() for x in glob.glob(str(p / "**/train*.log"), recursive=True)):
+                          candidates.append(p)
+                      elif (p / "train.log").is_file():
+                          candidates.append(p)
+                  candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                  return candidates
+
+              HLS4ML_COLS = [
+                  "Test Accuracy (%)", "ROC AUC",
+                  "Bg Rej W", "Bg Rej Z", "Bg Rej t", "Avg Bg Rej",
+                  "# Params", "FLOPs",
+              ]
+              JETCLASS_COLS = (
+                  ["Test Accuracy (%)", "ROC AUC"]
+                  + [f"1/FPR {lab}" for lab in JETCLASS_LABELS]
+                  + ["Avg 1/FPR", "# Params", "FLOPs"]
+              )
+
+              def main():
+                  if not MODELS:
+                      raise SystemExit(f"[FATAL] No models found under {SAVE_BASE}")
+
+                  hls4ml_rows   = []
+                  jetclass_rows = []
+
+                  for model_name in MODELS:
+                      model_dir = SAVE_BASE / model_name
+                      if not model_dir.is_dir():
+                          print(f"[WARN] missing model dir: {model_dir}", flush=True)
+                          continue
+
+                      print(f"\n===== MODEL: {model_name} =====", flush=True)
+
+                      all_trials = collect_leaf_trial_dirs(model_dir)
+                      if not all_trials:
+                          print(f"[WARN] {model_dir}: no trial-* dirs with train logs — skipping", flush=True)
+                          continue
+
+                      if DEBUG:
+                          for td in all_trials:
+                              print(f"[DEBUG]   found: {td}  (mtime={td.stat().st_mtime:.0f})", flush=True)
+
+                      chosen = all_trials[:TRIALS]
+                      if len(chosen) < TRIALS:
+                          print(f"[WARN] {model_name}: only {len(chosen)}/{TRIALS} trials — skipping", flush=True)
+                          continue
+
+                      print(f"  using: {[str(p) for p in chosen]}", flush=True)
+
+                      parsed = []
+                      for run_dir in chosen:
+                          train_log = find_newest_matching(run_dir, TRAIN_LOG_GLOBS)
+                          if DEBUG:
+                              print(f"[DEBUG]   log={train_log}", flush=True)
+                          if train_log is None:
+                              print(f"[WARN] no train log in {run_dir}", flush=True)
+                              continue
+                          parsed.append(parse_train_log(train_log))
+
+                      if len(parsed) != TRIALS:
+                          print(f"[WARN] {model_name}: only {len(parsed)}/{TRIALS} logs parsed — skipping", flush=True)
+                          continue
+
+                      is_jc = any(p["is_jetclass"] for p in parsed)
+
+                      acc_pct, auc_vals, params_trials, flops_trials = [], [], [], []
+                      for m in parsed:
+                          if m.get("test_acc_frac") is not None: acc_pct.append(float(m["test_acc_frac"]) * 100.0)
+                          if m.get("roc_auc")       is not None: auc_vals.append(float(m["roc_auc"]))
+                          if m.get("params")        is not None: params_trials.append(int(m["params"]))
+                          if m.get("flops")         is not None: flops_trials.append(int(m["flops"]))
+
+                      if len(acc_pct) != TRIALS:
+                          print(f"[WARN] {model_name}: only {len(acc_pct)}/{TRIALS} acc entries — skipping", flush=True)
+                          continue
+
+                      params0 = params_trials[0] if params_trials else ""
+                      flops0  = flops_trials[0]  if flops_trials  else ""
+
+                      if is_jc:
+                          per_class = defaultdict(list)
+                          for m in parsed:
+                              inv = m.get("inv_fpr", {})
+                              for lab in JETCLASS_LABELS:
+                                  v = inv.get(lab.lower())
+                                  if v is not None: per_class[lab.lower()].append(v)
+
+                          row = {
+                              "model":             model_name,
+                              "Test Accuracy (%)": fmt_pm(acc_pct,  nd_mean=2, nd_sd=2),
+                              "ROC AUC":           fmt_pm(auc_vals,  nd_mean=4, nd_sd=4),
+                              "# Params":          str(params0),
+                              "FLOPs":             str(flops0),
+                          }
+                          for lab in JETCLASS_LABELS:
+                              row[f"1/FPR {lab}"] = fmt_pm(per_class[lab.lower()], nd_mean=4, nd_sd=4)
+
+                          per_trial_avg = []
+                          for m in parsed:
+                              inv = m.get("inv_fpr", {})
+                              trial_vals = [inv[lab.lower()] for lab in JETCLASS_LABELS if inv.get(lab.lower()) is not None]
+                              if trial_vals: per_trial_avg.append(sum(trial_vals) / len(trial_vals))
+                          row["Avg 1/FPR"] = fmt_pm(per_trial_avg, nd_mean=4, nd_sd=4)
+                          jetclass_rows.append(row)
+
+                      else:
+                          brw, brz, brt, bravg = [], [], [], []
+                          for m in parsed:
+                              w  = m.get("bg_rej_w")
+                              z  = m.get("bg_rej_z")
+                              tt = m.get("bg_rej_t")
+                              if w  is not None: brw.append(float(w))
+                              if z  is not None: brz.append(float(z))
+                              if tt is not None: brt.append(float(tt))
+                              if w is not None and z is not None and tt is not None:
+                                  bravg.append((float(w) + float(z) + float(tt)) / 3.0)
+
+                          row = {
+                              "model":             model_name,
+                              "Test Accuracy (%)": fmt_pm(acc_pct,  nd_mean=2, nd_sd=2),
+                              "ROC AUC":           fmt_pm(auc_vals,  nd_mean=4, nd_sd=4),
+                              "Bg Rej W":          fmt_pm(brw,       nd_mean=4, nd_sd=4),
+                              "Bg Rej Z":          fmt_pm(brz,       nd_mean=4, nd_sd=4),
+                              "Bg Rej t":          fmt_pm(brt,       nd_mean=4, nd_sd=4),
+                              "Avg Bg Rej":        fmt_pm(bravg,     nd_mean=4, nd_sd=4),
+                              "# Params":          str(params0),
+                              "FLOPs":             str(flops0),
+                          }
+                          hls4ml_rows.append(row)
+
+                  def print_table(rows, cols, title):
+                      if not rows: return
+                      all_cols = ["model"] + cols
+                      print(f"\n\n===== {title} (Markdown) =====\n", flush=True)
+                      print("| " + " | ".join(all_cols) + " |", flush=True)
+                      print("| " + " | ".join(["---"] * len(all_cols)) + " |", flush=True)
+                      for r in rows:
+                          print("| " + " | ".join(str(r.get(c, "")) for c in all_cols) + " |", flush=True)
+                      print(f"\n\n===== {title} TSV (PASTE THIS) =====\n", flush=True)
+                      print("\t".join(all_cols), flush=True)
+                      for r in rows:
+                          print("\t".join(str(r.get(c, "")) for c in all_cols), flush=True)
+
+                  print_table(hls4ml_rows,   HLS4ML_COLS,   "RESULTS hls4ml")
+                  print_table(jetclass_rows, JETCLASS_COLS, "RESULTS jetclass")
+
+                  if not hls4ml_rows and not jetclass_rows:
+                      raise SystemExit("[FATAL] No valid results to display.")
+
+              if __name__ == "__main__":
+                  main()
+              PY
+
+              python /tmp/summarize.py
+
+          volumeMounts:
+            - name: j-jepa-vol
+              mountPath: /j-jepa-vol
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: j-jepa-vol
+          persistentVolumeClaim:
+            claimName: j-jepa-vol

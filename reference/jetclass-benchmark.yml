@@ -1,0 +1,163 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-jetclass-1p3m-benchmark # this is a compilation of different models and configs, just for reference based on the iclr branch of SAL-T4HEP just for reference. use relevant logic here for subsequent ymls inspired by this script.
+  namespace: cms-ml
+spec:
+  completions: 15
+  parallelism: 15
+  completionMode: Indexed
+  backoffLimit: 4
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+
+              # ── index → (model, trial) mapping ─────────────────────────────
+              # indices 0-2:   JEDI-Linear       trials 0,1,2
+              # indices 3-5:   Transformer       trials 0,1,2
+              # indices 6-8:   PTv3 config1      trials 0,1,2  (disable_pool, gelu, learned_pool, proj=True, gated=True)
+              # indices 9-11:  PTv3 config2      trials 0,1,2  (pool, gelu, learned_pool, proj=True, gated=False)
+              # indices 12-14: PTv3 config3      trials 0,1,2  (pool, gelu, mean, proj=True, gated=False)
+
+              IDX=$JOB_COMPLETION_INDEX
+              MODEL_IDX=$((IDX / 3))
+
+              REPO_DIR="/tmp/sal_t_iclr_benchmark"
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout iclr || true
+                git pull || true
+              else
+                git clone https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout iclr
+              fi
+              cd "$REPO_DIR/scripts"
+
+
+              DATA_DIR="/j-jepa-vol/linformer_data/JetClass/kinematics"
+              SAVE_BASE="/j-jepa-vol/1p3m_FLOPs_runs"
+              mkdir -p "$SAVE_BASE"
+
+              if [ "$MODEL_IDX" -eq 0 ]; then
+                echo "=== JEDI-Linear (index=$IDX) ==="
+                python3 train_jedi_linear.py \
+                  --data_dir       "$DATA_DIR" \
+                  --save_dir       "$SAVE_BASE/jedi_linear" \
+                  --dataset        jetclass \
+                  --sort_by        kt \
+                  --preset         custom \
+                  --embedding_dim  20 \
+                  --num_blocks     2 \
+                  --channel_hidden 40 \
+                  --head_hidden    20 \
+                  --aggregation    mean \
+                  --batch_size     4096
+
+              elif [ "$MODEL_IDX" -eq 1 ]; then
+                echo "=== Transformer (index=$IDX) ==="
+                python3 train_transformer.py \
+                  --data_dir      "$DATA_DIR" \
+                  --save_dir      "$SAVE_BASE/transformer" \
+                  --dataset       jetclass \
+                  --sort_by       kt \
+                  --num_particles 150 \
+                  --d_model       8 \
+                  --d_ff          32 \
+                  --num_heads     2
+
+              elif [ "$MODEL_IDX" -eq 2 ]; then
+                echo "=== PTv3 config1 (index=$IDX) ==="
+                python3 train_point_transformer.py \
+                  --data_dir             "$DATA_DIR" \
+                  --save_dir             "$SAVE_BASE/ptv3_config1" \
+                  --dataset              jetclass \
+                  --sort_by              kt \
+                  --model_size           small \
+                  --enc_patch_sizes      10 \
+                  --ffn_activation       gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode learned_pool \
+                  --message_proj \
+                  --message_gated \
+                  --disable_pool
+
+              elif [ "$MODEL_IDX" -eq 3 ]; then
+                echo "=== PTv3 config2 (index=$IDX) ==="
+                python3 train_point_transformer.py \
+                  --data_dir             "$DATA_DIR" \
+                  --save_dir             "$SAVE_BASE/ptv3_config2" \
+                  --dataset              jetclass \
+                  --sort_by              kt \
+                  --model_size           small \
+                  --enc_patch_sizes      10 \
+                  --ffn_activation       gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode learned_pool \
+                  --message_proj \
+                  --no_message_gated
+
+              elif [ "$MODEL_IDX" -eq 4 ]; then
+                echo "=== PTv3 config3 (index=$IDX) ==="
+                python3 train_point_transformer.py \
+                  --data_dir             "$DATA_DIR" \
+                  --save_dir             "$SAVE_BASE/ptv3_config3" \
+                  --dataset              jetclass \
+                  --sort_by              kt \
+                  --model_size           small \
+                  --enc_patch_sizes      10 \
+                  --ffn_activation       gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode mean \
+                  --message_proj \
+                  --no_message_gated
+              fi
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
