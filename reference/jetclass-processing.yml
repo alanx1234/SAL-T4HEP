@@ -59,15 +59,42 @@ spec:
 
               python3 -m pip install --no-cache-dir awkward uproot vector
 
-              RAW_DIR="${RAW_DIR:-/j-jepa-vol/linformer_data/JetClass}"
+              RAW_DIR="${RAW_DIR:-/j-jepa-vol/JetClass}"
               OUTPUT_DIR="${OUTPUT_DIR:-/j-jepa-vol/linformer_data/JetClass/kinematics_2m}"
               mkdir -p "$OUTPUT_DIR"
 
               test -f scripts/process_jetclass_kinematics.py
               python3 -m py_compile scripts/process_jetclass_kinematics.py
-              test -d "$RAW_DIR/Pythia/train_100M"
-              test -d "$RAW_DIR/Pythia/val_5M"
-              test -d "$RAW_DIR/Pythia/test_20M"
+
+              if [ -z "$RAW_DIR" ]; then
+                for candidate in \
+                  /j-jepa-vol/linformer_data/JetClass \
+                  /j-jepa-vol/linformer_data/JetClass/raw \
+                  /j-jepa-vol/JetClass \
+                  /j-jepa-vol/JetClass/raw
+                do
+                  if [ -d "$candidate/Pythia/train_100M" ] && \
+                     [ -d "$candidate/Pythia/val_5M" ] && \
+                     [ -d "$candidate/Pythia/test_20M" ]; then
+                    RAW_DIR="$candidate"
+                    break
+                  fi
+                done
+              fi
+
+              if [ -z "$RAW_DIR" ] || \
+                 [ ! -d "$RAW_DIR/Pythia/train_100M" ] || \
+                 [ ! -d "$RAW_DIR/Pythia/val_5M" ] || \
+                 [ ! -d "$RAW_DIR/Pythia/test_20M" ]; then
+                echo "Could not find JetClass ROOT directories."
+                echo "Expected RAW_DIR/Pythia/{train_100M,val_5M,test_20M}."
+                echo "RAW_DIR=${RAW_DIR:-unset}"
+                echo "Top-level /j-jepa-vol:"
+                find /j-jepa-vol -maxdepth 3 -type d | sort | head -200
+                exit 1
+              fi
+
+              echo "Using RAW_DIR=$RAW_DIR"
 
               python3 scripts/process_jetclass_kinematics.py \
                 --raw_dir "$RAW_DIR" \
@@ -77,7 +104,7 @@ spec:
                 --maxlen 150 \
                 --num_train 2000000 \
                 --num_val 200000 \
-                --num_test 1000000 \
+                --num_test 20000000 \
                 --shuffle_seed 42 \
                 --shuffle_chunk_size 50000
 

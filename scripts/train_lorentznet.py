@@ -54,12 +54,15 @@ def parse_args():
     p.add_argument("--num_particles", type=int, default=150)
     p.add_argument("--num_particles_truncate", type=int, default=None)
     p.add_argument("--num_epochs", type=int, default=35)
+    p.add_argument("--early_stopping_patience", type=int, default=0, help="0 disables early stopping")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--n_hidden", type=int, default=72)
     p.add_argument("--n_layers", type=int, default=6)
     p.add_argument("--c_weight", type=float, default=5e-3)
     p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--test_only", action="store_true", help="Skip training and evaluate a checkpoint")
+    p.add_argument("--checkpoint_path", default=None, help="Checkpoint path to load with --test_only")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -107,16 +110,31 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("Device: %s", device)
 
-    x_train, x_val, y_train, y_val, p4_train, p4_val = load_data(
-        args.dataset, args.data_dir, num_particles, args.val_split
-    )
-    x_train, p4_train = apply_sorting(x_train, args.sort_by, p4_train)
-    x_val, p4_val = apply_sorting(x_val, args.sort_by, p4_val)
-    x_train, p4_train = truncate_arrays(x_train, p4_train, args.num_particles_truncate)
-    x_val, p4_val = truncate_arrays(x_val, p4_val, args.num_particles_truncate)
-    logging.info("Loaded train x=%s y=%s val x=%s y=%s", x_train.shape, y_train.shape, x_val.shape, y_val.shape)
+    if args.test_only and args.checkpoint_path is None:
+        raise ValueError("--checkpoint_path is required with --test_only")
 
-    val_loader = make_loader(x_val, p4_val, y_val, args.batch_size, shuffle=False)
+    if args.test_only:
+        x_train = y_train = p4_train = None
+        val_loader = None
+        n_model_nodes = args.num_particles_truncate or num_particles
+        dummy_x = np.zeros((1, n_model_nodes, 3), dtype=np.float32)
+        dummy_y = np.zeros((1, num_classes), dtype=np.float32)
+        dummy_y[0, 0] = 1.0
+        dummy_p4 = np.zeros((1, n_model_nodes, 4), dtype=np.float32)
+        dummy_p4[:, :, 0] = 1.0
+        first_batch = next(iter(make_loader(dummy_x, dummy_p4, dummy_y, 1, shuffle=False)))
+    else:
+        x_train, x_val, y_train, y_val, p4_train, p4_val = load_data(
+            args.dataset, args.data_dir, num_particles, args.val_split
+        )
+        x_train, p4_train = apply_sorting(x_train, args.sort_by, p4_train)
+        x_val, p4_val = apply_sorting(x_val, args.sort_by, p4_val)
+        x_train, p4_train = truncate_arrays(x_train, p4_train, args.num_particles_truncate)
+        x_val, p4_val = truncate_arrays(x_val, p4_val, args.num_particles_truncate)
+        logging.info("Loaded train x=%s y=%s val x=%s y=%s", x_train.shape, y_train.shape, x_val.shape, y_val.shape)
+
+        val_loader = make_loader(x_val, p4_val, y_val, args.batch_size, shuffle=False)
+        first_batch = next(iter(val_loader))
 
     model = LorentzNet(
         n_scalar=1,
@@ -130,18 +148,34 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    first_batch = next(iter(val_loader))
     flops = get_flops_profiler(model, first_batch, device, forward_lorentznet)
     if flops:
         flops_per_event = flops // len(first_batch[-1])
         logging.info("FLOPs per inference: %d", flops_per_event)
         logging.info("MACs per inference: %d", flops_per_event // 2)
 
+    if args.test_only:
+        logging.info("Loading checkpoint: %s", args.checkpoint_path)
+        model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
+        x_test, y_test, p4_test = load_test_data(args.dataset, args.data_dir, num_particles)
+        x_test, p4_test = apply_sorting(x_test, args.sort_by, p4_test)
+        x_test, p4_test = truncate_arrays(x_test, p4_test, args.num_particles_truncate)
+        test_loader = make_loader(x_test, p4_test, y_test, args.batch_size, shuffle=False)
+        first_test_batch = next(iter(test_loader))
+        avg_ns = time_inference(model, first_test_batch, len(first_test_batch[-1]), device, forward_lorentznet)
+        logging.info("Avg inference time/event: %.2f ns", avg_ns)
+        labels, y_onehot, probs, acc, auc_m = evaluate(model, test_loader, device, forward_lorentznet, num_classes)
+        logging.info("Test Accuracy: %.4f, ROC AUC: %.4f", acc, auc_m)
+        plot_and_log_metrics(labels, y_onehot, probs, args.dataset, save_dir)
+        return
+
     histories = {"train_loss": [], "val_loss": [], "train_accuracy": [], "val_accuracy": []}
     best_val = float("inf")
     schedule = parse_training_schedule(args.schedule, args.batch_size, args.num_epochs)
     total_epochs = sum(ep for _, ep in schedule)
     current_epoch = 0
+    patience_counter = 0
+    should_stop = False
     logging.info("Training schedule: %s", schedule)
     for stage_idx, (stage_batch_size, stage_epochs) in enumerate(schedule):
         set_optimizer_lr(optimizer, args.lr)
@@ -174,8 +208,20 @@ def main():
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pt"))
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if args.early_stopping_patience > 0 and patience_counter >= args.early_stopping_patience:
+                logging.info("Early stopping at epoch %d", current_epoch)
+                should_stop = True
+                break
+        if should_stop:
+            break
 
     torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pt"))
+    best_path = os.path.join(save_dir, "best_model.pt")
+    if os.path.exists(best_path):
+        model.load_state_dict(torch.load(best_path, map_location=device))
     save_curves(save_dir, histories)
 
     x_test, y_test, p4_test = load_test_data(args.dataset, args.data_dir, num_particles)

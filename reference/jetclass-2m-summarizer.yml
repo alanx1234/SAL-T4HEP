@@ -1,0 +1,177 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-jetclass-2m-summarize
+  namespace: cms-ml
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: summarize
+          image: python:3.11-slim
+          command: ["/bin/bash", "-lc"]
+          env:
+            - name: PYTHONIOENCODING
+              value: "utf-8"
+            - name: LC_ALL
+              value: "C.UTF-8"
+            - name: SAVE_BASE
+              value: "/j-jepa-vol/jetclass_2m_benchmark_runs"
+            - name: MODELS
+              value: "jedi_linear,transformer,ptv3_config1,ptv3_config2,ptv3_config3,lorentznet,lgatr,salt_jetclass,part_d10_h2_pe4_jetclass,linformer_jetclass"
+            - name: TRIALS
+              value: "3"
+          args:
+            - |
+              set -euo pipefail
+
+              cat > /tmp/summarize_jetclass.py << 'PY'
+              from __future__ import annotations
+              import glob
+              import math
+              import os
+              import re
+              import sys
+              from collections import defaultdict
+              from pathlib import Path
+
+              sys.stdout.reconfigure(encoding="utf-8")
+
+              SAVE_BASE = Path(os.environ["SAVE_BASE"])
+              MODELS = [m.strip() for m in os.environ["MODELS"].split(",") if m.strip()]
+              TRIALS = int(os.environ.get("TRIALS", "3"))
+              LABELS = [
+                  "label_QCD", "label_Hbb", "label_Hcc", "label_Hgg", "label_H4q",
+                  "label_Hqql", "label_Zqq", "label_Wqq", "label_Tbqq", "label_Tbl",
+              ]
+
+              RX_TEST_ACC = re.compile(r"Test\s*Accuracy:\s*([0-9]*\.?[0-9]+)", re.I)
+              RX_ROC_AUC = re.compile(r"ROC\s*AUC:\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
+              RX_TOTAL_PARAMS = re.compile(r"Total\s+params:\s*([0-9]+)", re.I)
+              RX_FLOPS = re.compile(r"FLOPs\s*per\s*inference:\s*([0-9]+)", re.I)
+              RX_INV_FPR = re.compile(r"1/FPR@0\.8\s+for\s+(\S+):\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
+
+              def number(s):
+                  try:
+                      return float(s)
+                  except Exception:
+                      return None
+
+              def last(rx, text, cast=float):
+                  hits = rx.findall(text)
+                  if not hits:
+                      return None
+                  hit = hits[-1]
+                  if isinstance(hit, tuple):
+                      hit = hit[0]
+                  try:
+                      return cast(hit)
+                  except Exception:
+                      return None
+
+              def sd(xs):
+                  xs = [x for x in xs if x is not None and math.isfinite(x)]
+                  if len(xs) <= 1:
+                      return 0.0
+                  mu = sum(xs) / len(xs)
+                  return math.sqrt(sum((x - mu) ** 2 for x in xs) / (len(xs) - 1))
+
+              def fmt(xs, nd_mean=4, nd_sd=4, scale=1.0):
+                  vals = [x * scale for x in xs if x is not None and math.isfinite(x)]
+                  if not vals:
+                      return ""
+                  return f"{sum(vals) / len(vals):.{nd_mean}f} +/- {sd(vals):.{nd_sd}f}"
+
+              def trial_logs(model_dir):
+                  complete = []
+                  incomplete = []
+                  for p in model_dir.rglob("trial-*"):
+                      log_path = p / "train.log"
+                      if not (p.is_dir() and log_path.is_file()):
+                          continue
+                      text = log_path.read_text(errors="ignore")
+                      if RX_TEST_ACC.search(text) and RX_ROC_AUC.search(text):
+                          complete.append((p, text))
+                      else:
+                          incomplete.append(p)
+                  complete.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+                  incomplete.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                  return complete[:TRIALS], incomplete
+
+              rows = []
+              for model in MODELS:
+                  entries, incomplete = trial_logs(SAVE_BASE / model)
+                  if incomplete:
+                      print(f"[WARN] {model}: ignored {len(incomplete)} incomplete trial logs under {SAVE_BASE / model}")
+                  if len(entries) < TRIALS:
+                      print(f"[WARN] {model}: found {len(entries)}/{TRIALS} complete trials under {SAVE_BASE / model}")
+                      continue
+                  parsed = []
+                  for d, text in entries:
+                      inv = defaultdict(list)
+                      for label, value in RX_INV_FPR.findall(text):
+                          v = number(value)
+                          if v is not None:
+                              inv[label.lower()].append(v)
+                      parsed.append({
+                          "acc": last(RX_TEST_ACC, text, float),
+                          "auc": last(RX_ROC_AUC, text, float),
+                          "params": last(RX_TOTAL_PARAMS, text, int),
+                          "flops": last(RX_FLOPS, text, int),
+                          "inv": {k: vals[-1] for k, vals in inv.items() if vals},
+                      })
+                  row = {
+                      "model": model,
+                      "Test Accuracy (%)": fmt([p["acc"] for p in parsed], 2, 2, 100.0),
+                      "ROC AUC": fmt([p["auc"] for p in parsed], 4, 4),
+                      "# Params": str(next((p["params"] for p in parsed if p["params"] is not None), "")),
+                      "FLOPs": str(next((p["flops"] for p in parsed if p["flops"] is not None), "")),
+                  }
+                  per_trial_avg = []
+                  for label in LABELS:
+                      vals = [p["inv"].get(label.lower()) for p in parsed]
+                      row[f"1/FPR {label}"] = fmt(vals, 4, 4)
+                  for p in parsed:
+                      vals = [p["inv"].get(label.lower()) for label in LABELS]
+                      vals = [v for v in vals if v is not None and math.isfinite(v)]
+                      if vals:
+                          per_trial_avg.append(sum(vals) / len(vals))
+                  row["Avg 1/FPR"] = fmt(per_trial_avg, 4, 4)
+                  rows.append(row)
+
+              cols = (
+                  ["model", "Test Accuracy (%)", "ROC AUC"]
+                  + [f"1/FPR {label}" for label in LABELS]
+                  + ["Avg 1/FPR", "# Params", "FLOPs"]
+              )
+              if not rows:
+                  raise SystemExit("[FATAL] No complete JetClass rows found")
+              print("\n===== JetClass 2M Benchmark (Markdown) =====\n")
+              print("| " + " | ".join(cols) + " |")
+              print("| " + " | ".join(["---"] * len(cols)) + " |")
+              for row in rows:
+                  print("| " + " | ".join(str(row.get(c, "")) for c in cols) + " |")
+              print("\n===== JetClass 2M Benchmark TSV =====\n")
+              print("\t".join(cols))
+              for row in rows:
+                  print("\t".join(str(row.get(c, "")) for c in cols))
+              PY
+
+              python /tmp/summarize_jetclass.py
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol

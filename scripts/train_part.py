@@ -38,6 +38,23 @@ if PROJECT_ROOT not in sys.path:
 from models.parT import ParticleTransformer
 
 
+def parse_training_schedule(schedule, batch_size, num_epochs):
+    if schedule is None or str(schedule).strip().lower() in ("", "none", "off", "false"):
+        return [(batch_size, num_epochs)]
+    parsed = []
+    for item in str(schedule).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Schedule item '{item}' must be formatted as batch_size:epochs")
+        bs, ep = item.split(":", 1)
+        parsed.append((int(bs), int(ep)))
+    if not parsed:
+        raise ValueError("Training schedule is empty")
+    return parsed
+
+
 # ─── Data helpers ─────────────────────────────────────────────────────────────
 
 def ptetaphi_to_p4(x_np):
@@ -363,6 +380,15 @@ def parse_args():
     p.add_argument("--save_dir", required=True)
     p.add_argument("--dataset", choices=["hls4ml", "top", "QG", "jetclass"], default="hls4ml")
     p.add_argument("--sort_by", choices=["pt", "eta", "phi", "delta_R", "kt"], default="kt")
+    p.add_argument("--batch_size", type=int, default=1024)
+    p.add_argument("--num_epochs", type=int, default=500)
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument(
+        "--schedule",
+        default="128:200,256:200,512:200,1024:200,1024:200,1024:400",
+        help="Comma-separated training schedule as batch_size:epochs. Use 'none' for --batch_size/--num_epochs.",
+    )
+    p.add_argument("--early_stopping_patience", type=int, default=40)
     p.add_argument("--val_split", type=float, default=0.2)
     p.add_argument("--num_particles", type=int, default=150)
 
@@ -376,6 +402,8 @@ def parse_args():
     p.add_argument("--no_pair_embed", action="store_true", help="Disable pair embedding entirely")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--flops_only", action="store_true", help="Build model, report FLOPs, then exit")
+    p.add_argument("--test_only", action="store_true", help="Skip training and evaluate a checkpoint")
+    p.add_argument("--checkpoint_path", default=None, help="Checkpoint path to load with --test_only")
     return p.parse_args()
 
 
@@ -420,29 +448,38 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("Device: %s", device)
 
-    # ── Load data ──────────────────────────────────────────────────────────
-    x_train, x_val, y_train, y_val = load_data(
-        args.dataset, args.data_dir, num_particles, args.val_split
-    )
-    logging.info("Loaded train x=%s y=%s, val x=%s y=%s",
-                 x_train.shape, y_train.shape, x_val.shape, y_val.shape)
+    if args.test_only and args.checkpoint_path is None:
+        raise ValueError("--checkpoint_path is required with --test_only")
 
-    x_train = apply_sorting(x_train, args.sort_by)
-    x_val = apply_sorting(x_val, args.sort_by)
+    if args.test_only:
+        x_train_t = torch.zeros((1, 3, num_particles), dtype=torch.float32)
+        v_train_t = torch.zeros((1, 4, num_particles), dtype=torch.float32)
+        mask_train_t = torch.ones((1, 1, num_particles), dtype=torch.float32)
+        x_val_t = v_val_t = mask_val_t = y_val_t = None
+    else:
+        # ── Load data ──────────────────────────────────────────────────────
+        x_train, x_val, y_train, y_val = load_data(
+            args.dataset, args.data_dir, num_particles, args.val_split
+        )
+        logging.info("Loaded train x=%s y=%s, val x=%s y=%s",
+                     x_train.shape, y_train.shape, x_val.shape, y_val.shape)
 
-    # Prepare ParT-format inputs
-    x_train_feat, v_train, mask_train = prepare_part_inputs(x_train)
-    x_val_feat, v_val, mask_val = prepare_part_inputs(x_val)
+        x_train = apply_sorting(x_train, args.sort_by)
+        x_val = apply_sorting(x_val, args.sort_by)
 
-    x_train_t = torch.FloatTensor(x_train_feat)
-    v_train_t = torch.FloatTensor(v_train)
-    mask_train_t = torch.FloatTensor(mask_train)
-    y_train_t = torch.FloatTensor(y_train)
+        # Prepare ParT-format inputs
+        x_train_feat, v_train, mask_train = prepare_part_inputs(x_train)
+        x_val_feat, v_val, mask_val = prepare_part_inputs(x_val)
 
-    x_val_t = torch.FloatTensor(x_val_feat)
-    v_val_t = torch.FloatTensor(v_val)
-    mask_val_t = torch.FloatTensor(mask_val)
-    y_val_t = torch.FloatTensor(y_val)
+        x_train_t = torch.FloatTensor(x_train_feat)
+        v_train_t = torch.FloatTensor(v_train)
+        mask_train_t = torch.FloatTensor(mask_train)
+        y_train_t = torch.FloatTensor(y_train)
+
+        x_val_t = torch.FloatTensor(x_val_feat)
+        v_val_t = torch.FloatTensor(v_val)
+        mask_val_t = torch.FloatTensor(mask_val)
+        y_val_t = torch.FloatTensor(y_val)
 
     # ── Build model ────────────────────────────────────────────────────────
     pair_embed_dims = None if args.no_pair_embed else args.pair_embed_dims
@@ -493,23 +530,27 @@ def main():
     if args.flops_only:
         return
 
+    if args.test_only:
+        logging.info("Loading checkpoint: %s", args.checkpoint_path)
+        model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
+        run_testing(model, args.dataset, args.data_dir, save_dir,
+                    args.sort_by, args.batch_size, num_particles, device)
+        logging.info("Test-only evaluation complete!")
+        return
+
     # ── Train ──────────────────────────────────────────────────────────────
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    schedule = [
-        (128, 200),
-        (256, 200),
-        (512, 200),
-        (1024, 200),
-        (1024, 200),
-        (1024, 400),
-    ]
+    schedule = parse_training_schedule(args.schedule, args.batch_size, args.num_epochs)
+    logging.info("Training schedule: %s", schedule)
 
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
     best_val_loss = float('inf')
     current_epoch = 0
+    patience_counter = 0
+    should_stop = False
 
     for batch_size, num_epochs in schedule:
         logging.info("Training batch_size=%d for %d epochs", batch_size, num_epochs)
@@ -517,17 +558,16 @@ def main():
 
         train_loader = DataLoader(
             TensorDataset(x_train_t, v_train_t, mask_train_t, y_train_t),
-            batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True
+            batch_size=batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True
         )
         val_loader = DataLoader(
             TensorDataset(x_val_t, v_val_t, mask_val_t, y_val_t),
-            batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True
+            batch_size=batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True
         )
 
         for pg in optimizer.param_groups:
             pg['lr'] = 1e-3
 
-        patience_counter = 0
         for epoch in range(num_epochs):
             t_loss, t_acc = train_epoch(model, train_loader, criterion, optimizer, device)
             v_loss, v_acc = validate(model, val_loader, criterion, device)
@@ -550,12 +590,15 @@ def main():
             else:
                 patience_counter += 1
 
-            if patience_counter >= 40:
+            if patience_counter >= args.early_stopping_patience:
                 logging.info("Early stopping at epoch %d", current_epoch + epoch + 1)
                 print(f"  Early stopping at epoch {current_epoch + epoch + 1}")
+                should_stop = True
                 break
 
-        current_epoch += num_epochs
+        current_epoch += epoch + 1
+        if should_stop:
+            break
 
     # ── Save & plot ────────────────────────────────────────────────────────
     torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pt"))
@@ -579,7 +622,7 @@ def main():
 
     # ── Test ───────────────────────────────────────────────────────────────
     run_testing(model, args.dataset, args.data_dir, save_dir,
-                args.sort_by, 4096, num_particles, device)
+                args.sort_by, args.batch_size, num_particles, device)
 
     logging.info("Training complete!")
     print(f"\nDone! Results in {save_dir}")

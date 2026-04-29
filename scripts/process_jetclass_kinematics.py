@@ -228,7 +228,7 @@ def parse_args():
     p.add_argument("--feature_set", choices=["ptetaphi", "kin7"], default="ptetaphi")
     p.add_argument("--num_train", type=int, default=2_000_000)
     p.add_argument("--num_val", type=int, default=200_000)
-    p.add_argument("--num_test", type=int, default=1_000_000)
+    p.add_argument("--num_test", type=int, default=20_000_000)
     p.add_argument("--shuffle_seed", type=int, default=42)
     p.add_argument("--shuffle_chunk_size", type=int, default=50_000)
     p.add_argument("--no_shuffle", action="store_true")

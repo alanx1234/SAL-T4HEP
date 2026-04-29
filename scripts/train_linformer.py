@@ -28,6 +28,23 @@ from models.Linformer import build_linformer_transformer_classifier
 from models.LinformerBig import build_linformer_transformer_classifier_big
 
 
+def parse_training_schedule(schedule, batch_size, num_epochs):
+    if schedule is None or str(schedule).strip().lower() in ("", "none", "off", "false"):
+        return [(batch_size, num_epochs)]
+    parsed = []
+    for item in str(schedule).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Schedule item '{item}' must be formatted as batch_size:epochs")
+        bs, ep = item.split(":", 1)
+        parsed.append((int(bs), int(ep)))
+    if not parsed:
+        raise ValueError("Training schedule is empty")
+    return parsed
+
+
 # ---------------------------
 # FLOPs computation (no mask)
 # ---------------------------
@@ -246,6 +263,15 @@ def parse_args():
         default="pt",
     )
     p.add_argument("--batch_size", type=int, default=4096)
+    p.add_argument("--num_epochs", type=int, default=500)
+    p.add_argument(
+        "--schedule",
+        default="128:200,256:200,512:200,1024:200,2048:200,4096:400",
+        help="Comma-separated training schedule as batch_size:epochs. Use 'none' for --batch_size/--num_epochs.",
+    )
+    p.add_argument("--early_stopping_patience", type=int, default=40)
+    p.add_argument("--test_only", action="store_true", help="Skip training and evaluate a checkpoint")
+    p.add_argument("--checkpoint_path", default=None, help="Weights path to load with --test_only")
     p.add_argument("--val_split", type=float, default=0.2)
     p.add_argument(
         "--num_particles", type=int, default=150, help="Ignored for 'jetclass'; use default"
@@ -313,18 +339,22 @@ def main():
         num_particles = 150
         output_dim = 10
         loss_fn = "categorical_crossentropy"
+        feature_dim = 3
     elif args.dataset == "top":
         num_particles = 200
         output_dim = 1
         loss_fn = "binary_crossentropy"
+        feature_dim = 3
     elif args.dataset == "QG":
         num_particles = 150
         output_dim = 1
         loss_fn = "binary_crossentropy"
+        feature_dim = 3
     else:  # hls4ml
         num_particles = args.num_particles
         output_dim = 5
         loss_fn = "categorical_crossentropy"
+        feature_dim = 3
 
     # prepare save directory
     save_dir = os.path.join(args.save_dir, str(num_particles), args.sort_by)
@@ -346,8 +376,13 @@ def main():
     )
     logging.info("Args: %s", args)
 
+    if args.test_only and args.checkpoint_path is None:
+        raise ValueError("--checkpoint_path is required with --test_only")
+
     # load train/val
-    if args.dataset == "hls4ml":
+    if args.test_only:
+        logging.info("Skipping train/val loading for test-only evaluation")
+    elif args.dataset == "hls4ml":
         x = np.load(
             os.path.join(
                 args.data_dir, f"x_train_robust_{num_particles}const_ptetaphi.npy"
@@ -367,21 +402,25 @@ def main():
         x_val = np.load(os.path.join(args.data_dir, "val/features.npy"))
         y_val = np.load(os.path.join(args.data_dir, "val/labels.npy"))
 
-    if args.dataset == "jetclass":
+    if args.test_only:
+        pass
+    elif args.dataset == "jetclass":
         x_train = x_train.transpose(0, 2, 1)
         x_val = x_val.transpose(0, 2, 1)
 
-    logging.info(
-        "Loaded train x=%s y=%s, val x=%s y=%s",
-        x_train.shape,
-        y_train.shape,
-        x_val.shape,
-        y_val.shape,
-    )
+    if not args.test_only:
+        feature_dim = x_train.shape[2]
+        logging.info(
+            "Loaded train x=%s y=%s, val x=%s y=%s",
+            x_train.shape,
+            y_train.shape,
+            x_val.shape,
+            y_val.shape,
+        )
 
-    # apply sorting
-    x_train = apply_sorting(x_train, args.sort_by)
-    x_val = apply_sorting(x_val, args.sort_by)
+        # apply sorting
+        x_train = apply_sorting(x_train, args.sort_by)
+        x_val = apply_sorting(x_val, args.sort_by)
 
     # build and compile model
     if args.conv_filter_heights:
@@ -395,7 +434,7 @@ def main():
     if args.num_layers > 1:
         model = build_linformer_transformer_classifier_big(
             num_particles,
-            x_train.shape[2],
+            feature_dim,
             d_model=args.d_model,
             d_ff=args.d_ff,
             output_dim=output_dim,
@@ -415,7 +454,7 @@ def main():
     else:
         model = build_linformer_transformer_classifier(
             num_particles,
-            x_train.shape[2],
+            feature_dim,
             d_model=args.d_model,
             d_ff=args.d_ff,
             output_dim=output_dim,
@@ -443,7 +482,7 @@ def main():
         metrics=["accuracy"],
         jit_compile=args.jit_compile,
     )
-    flops = get_flops(model, (1, num_particles, x_train.shape[2]))
+    flops = get_flops(model, (1, num_particles, feature_dim))
     macs = flops // 2
     logging.info("FLOPs per inference: %d", flops)
     logging.info("MACs per inference: %d", macs)
@@ -455,6 +494,20 @@ def main():
     model.summary(print_fn=lambda l: logging.info(l))
     logging.info("Total params: %d", model.count_params())
 
+    if args.test_only:
+        logging.info("Loading checkpoint: %s", args.checkpoint_path)
+        model.load_weights(args.checkpoint_path)
+        run_testing(
+            model,
+            args.dataset,
+            args.data_dir,
+            save_dir,
+            args.sort_by,
+            args.batch_size,
+            num_particles,
+        )
+        return
+
     # callbacks
     ckpt = ModelCheckpoint(
         os.path.join(save_dir, "best.weights.h5"),
@@ -463,22 +516,11 @@ def main():
         verbose=1,
     )
     early = EarlyStopping(
-        monitor="val_loss", patience=40, restore_best_weights=True, verbose=1
+        monitor="val_loss", patience=args.early_stopping_patience, restore_best_weights=True, verbose=1
     )
 
-    # training schedule
-    schedule = [
-        (128, 200),
-        (256, 200),
-        (512, 200),
-        (1024, 200),
-        (2048, 200),
-        (4096, 400),
-    ]
-    # reduced training schedule due to OOM
-    # schedule = [
-    #     (512, 50)
-    # ]
+    schedule = parse_training_schedule(args.schedule, args.batch_size, args.num_epochs)
+    logging.info("Training schedule: %s", schedule)
 
     ce = 0
     histories = []

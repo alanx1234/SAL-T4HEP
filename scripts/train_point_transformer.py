@@ -29,6 +29,23 @@ from models.PointTransformerV3TF import build_ptv3_jet_classifier, build_jedi_pt
 from models.PointTransformer_serialized import build_ptv3_serialized_jet_classifier
 
 
+def parse_training_schedule(schedule, batch_size, num_epochs):
+		if schedule is None or str(schedule).strip().lower() in ("", "none", "off", "false"):
+				return [(batch_size, num_epochs)]
+		parsed = []
+		for item in str(schedule).split(","):
+				item = item.strip()
+				if not item:
+						continue
+				if ":" not in item:
+						raise ValueError(f"Schedule item '{item}' must be formatted as batch_size:epochs")
+				bs, ep = item.split(":", 1)
+				parsed.append((int(bs), int(ep)))
+		if not parsed:
+				raise ValueError("Training schedule is empty")
+		return parsed
+
+
 # ---------------------------
 # FLOPs computation (no mask)
 # ---------------------------
@@ -322,6 +339,15 @@ def parse_args():
 		    help="One or more test-time orderings to evaluate. Defaults to --sort_by."
 		)
 		p.add_argument("--batch_size", type=int, default=4096)
+		p.add_argument("--num_epochs", type=int, default=500)
+		p.add_argument(
+				"--schedule",
+				default="128:200,256:200,512:200,1024:200,1024:200,1024:400",
+				help="Comma-separated training schedule as batch_size:epochs. Use 'none' for --batch_size/--num_epochs.",
+		)
+		p.add_argument("--early_stopping_patience", type=int, default=40)
+		p.add_argument("--test_only", action="store_true", help="Skip training and evaluate a checkpoint")
+		p.add_argument("--checkpoint_path", default=None, help="Weights path to load with --test_only")
 		p.add_argument("--val_split", type=float, default=0.2)
 		p.add_argument("--num_particles_truncate", type=int, default=None,
 				help="If set, truncate to this many particles after sorting (e.g. 64 to keep top-64 by pt)")
@@ -374,18 +400,22 @@ def main():
 				num_particles = 150
 				output_dim = 10
 				loss_fn = "categorical_crossentropy"
+				feature_dim = 3
 		elif args.dataset == "top":
 				num_particles = 200
 				output_dim = 1
 				loss_fn = "binary_crossentropy"
+				feature_dim = 3
 		elif args.dataset == "QG":
 				num_particles = 150
 				output_dim = 1
 				loss_fn = "binary_crossentropy"
+				feature_dim = 3
 		else:  # hls4ml
 				num_particles = 150
 				output_dim = 5
 				loss_fn = "categorical_crossentropy"
+				feature_dim = 3
 
 		# prepare save directory
 		save_dir = os.path.join(args.save_dir, str(num_particles), args.sort_by)
@@ -407,8 +437,13 @@ def main():
 		)
 		logging.info("Args: %s", args)
 
+		if args.test_only and args.checkpoint_path is None:
+				raise ValueError("--checkpoint_path is required with --test_only")
+
 		# load train/val
-		if args.dataset == "hls4ml":
+		if args.test_only:
+				logging.info("Skipping train/val loading for test-only evaluation")
+		elif args.dataset == "hls4ml":
 				x = np.load(
 						os.path.join(
 								args.data_dir, f"x_train_robust_{num_particles}const_ptetaphi.npy"
@@ -428,29 +463,34 @@ def main():
 				x_val = np.load(os.path.join(args.data_dir, "val/features.npy"))
 				y_val = np.load(os.path.join(args.data_dir, "val/labels.npy"))
 
-		if args.dataset == "jetclass":
+		if args.test_only:
+				pass
+		elif args.dataset == "jetclass":
 				x_train = x_train.transpose(0, 2, 1)
 				x_val = x_val.transpose(0, 2, 1)
 
-		logging.info(
-				"Loaded train x=%s y=%s, val x=%s y=%s",
-				x_train.shape,
-				y_train.shape,
-				x_val.shape,
-				y_val.shape,
-		)
+		if not args.test_only:
+				feature_dim = x_train.shape[2]
+				logging.info(
+						"Loaded train x=%s y=%s, val x=%s y=%s",
+						x_train.shape,
+						y_train.shape,
+						x_val.shape,
+						y_val.shape,
+				)
 
-		# apply sorting
-		x_train = apply_sorting(x_train, args.sort_by, grid_size=args.morton_grid_size)
-		x_val   = apply_sorting(x_val,   args.sort_by, grid_size=args.morton_grid_size)
+				# apply sorting
+				x_train = apply_sorting(x_train, args.sort_by, grid_size=args.morton_grid_size)
+				x_val   = apply_sorting(x_val,   args.sort_by, grid_size=args.morton_grid_size)
 
 		# truncate to top-k particles if requested (e.g. 64 instead of 128)
 		num_particles_for_files = num_particles  # preserve original for filename lookup in run_testing
 		if args.num_particles_truncate is not None:
 				k = args.num_particles_truncate
 				assert k <= num_particles, f"--num_particles_truncate={k} > num_particles={num_particles}"
-				x_train = x_train[:, :k, :]
-				x_val   = x_val[:,   :k, :]
+				if not args.test_only:
+						x_train = x_train[:, :k, :]
+						x_val   = x_val[:,   :k, :]
 				num_particles = k
 				logging.info("Truncated to top-%d particles after sorting", k)
 		else:
@@ -487,8 +527,9 @@ def main():
 		remainder = num_particles % max_patch
 		if remainder != 0:
 				pad_len = max_patch - remainder
-				x_train = np.pad(x_train, ((0,0),(0,pad_len),(0,0)))
-				x_val   = np.pad(x_val,   ((0,0),(0,pad_len),(0,0)))
+				if not args.test_only:
+						x_train = np.pad(x_train, ((0,0),(0,pad_len),(0,0)))
+						x_val   = np.pad(x_val,   ((0,0),(0,pad_len),(0,0)))
 				num_particles = num_particles + pad_len
 				logging.info("Padded sequence to %d particles for patch_size=%d", num_particles, max_patch)
 
@@ -561,13 +602,34 @@ def main():
 		logging.info("Total params: %d", model.count_params())
 
 		# ── log FLOPs right after compile so we can verify config ──────────────
-		flops = get_flops(model, (1, num_particles, x_train.shape[2]))
+		flops = get_flops(model, (1, num_particles, feature_dim))
 		macs = flops // 2
 		logging.info("FLOPs per inference: %d", flops)
 		logging.info("MACs per inference: %d", macs)
 		print(f"FLOPs per inference: {flops}")
 		print(f"MACs  per inference: {macs}")
 		# ────────────────────────────────────────────────────────────────────────
+
+		if args.test_only:
+				logging.info("Loading checkpoint: %s", args.checkpoint_path)
+				model.load_weights(args.checkpoint_path)
+				for test_sort in test_sorts:
+				    logging.info("=" * 60)
+				    logging.info("TEST ORDERING: %s", test_sort)
+				    logging.info("=" * 60)
+				    run_testing(
+				        model,
+				        args.dataset,
+				        args.data_dir,
+				        save_dir,
+				        test_sort,
+				        args.batch_size,
+				        num_particles_for_files,
+				        morton_grid_size=args.morton_grid_size,
+				        num_particles_truncate=args.num_particles_truncate,
+				        enc_patch_sizes=enc_patch_sizes,
+				    )
+				return
 
 		# callbacks
 		ckpt = ModelCheckpoint(
@@ -577,17 +639,11 @@ def main():
 				verbose=1,
 		)
 		early = EarlyStopping(
-				monitor="val_loss", patience=40, restore_best_weights=True, verbose=1
+				monitor="val_loss", patience=args.early_stopping_patience, restore_best_weights=True, verbose=1
 		)
 
-		schedule = [
-		    (128, 200),
-		    (256, 200),
-		    (512, 200),
-		    (1024, 200),
-		    (1024, 200),
-		    (1024, 400),
-		]
+		schedule = parse_training_schedule(args.schedule, args.batch_size, args.num_epochs)
+		logging.info("Training schedule: %s", schedule)
 
 		ce = 0
 		histories = []

@@ -1,0 +1,112 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-hls4ml-equivariant-benchmark
+  namespace: cms-ml
+spec:
+  completions: 6
+  parallelism: 6
+  completionMode: Indexed
+  backoffLimit: 4
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euxo pipefail
+
+              # indices 0-2:  LorentzNet unconstrained trials 0,1,2
+              # indices 3-5:  L-GATr unconstrained trials 0,1,2
+
+              IDX=$JOB_COMPLETION_INDEX
+              MODEL_IDX=$((IDX / 3))
+
+              REPO_DIR="/tmp/sal_t_hls4ml_equivariant_benchmark"
+              REPO_REF="${REPO_REF:-iclr}"
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout "$REPO_REF"
+                git pull || true
+              else
+                git clone https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout "$REPO_REF"
+              fi
+
+              DATA_DIR="${DATA_DIR:-/j-jepa-vol/l1-jet-id/data/jetid/processed}"
+              SAVE_BASE="${SAVE_BASE:-/j-jepa-vol/1p3mFLOPs_runs}"
+              mkdir -p "$SAVE_BASE"
+
+              test -f "$DATA_DIR/x_train_robust_150const_ptetaphi.npy"
+              test -f "$DATA_DIR/y_train_robust_150const_ptetaphi.npy"
+              test -f "$DATA_DIR/x_val_robust_150const_ptetaphi.npy"
+              test -f "$DATA_DIR/y_val_robust_150const_ptetaphi.npy"
+
+              cd "$REPO_DIR/scripts"
+              python3 -m py_compile train_lorentznet.py train_lgatr.py
+
+              if [ "$MODEL_IDX" -eq 0 ]; then
+                echo "=== HLS4ML: LorentzNet unconstrained (index=$IDX) ==="
+                python3 train_lorentznet.py \
+                  --data_dir      "$DATA_DIR" \
+                  --save_dir      "$SAVE_BASE" \
+                  --dataset       hls4ml \
+                  --sort_by       kt \
+                  --num_particles 150
+
+              elif [ "$MODEL_IDX" -eq 1 ]; then
+                echo "=== HLS4ML: L-GATr unconstrained (index=$IDX) ==="
+                python3 -m pip install --no-cache-dir lgatr
+                python3 train_lgatr.py \
+                  --data_dir      "$DATA_DIR" \
+                  --save_dir      "$SAVE_BASE" \
+                  --dataset       hls4ml \
+                  --sort_by       kt \
+                  --num_particles 150
+              fi
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
