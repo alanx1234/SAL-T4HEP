@@ -1,0 +1,281 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-jetclass-20m-retest-1p3m
+  namespace: cms-ml
+spec:
+  completions: 24
+  parallelism: 8
+  completionMode: Indexed
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      containers:
+        - name: retest
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euxo pipefail
+
+              # indices 0-2:    JEDI-Linear trials 13,14,15
+              # indices 3-5:    Transformer trials 12,13,14
+              # indices 6-8:    PTv3 config1 trials 9,10,11
+              # indices 9-11:   PTv3 config2 trials 5,6,7
+              # indices 12-14:  PTv3 config3 trials 7,8,9
+              # indices 15-17:  SAL-T 1.3M-FLOPs trials 0,1,2
+              # indices 18-20:  ParT 1.3M-FLOPs trials 0,1,2
+              # indices 21-23:  Linformer 1.3M-FLOPs trials 0,1,2
+
+              IDX=$JOB_COMPLETION_INDEX
+              MODEL_IDX=$((IDX / 3))
+              TRIAL_IDX=$((IDX % 3))
+
+              REPO_DIR="/tmp/sal_t_jetclass_20m_retest"
+              REPO_REF="${REPO_REF:-iclr}"
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout "$REPO_REF"
+                git pull || true
+              else
+                git clone https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout "$REPO_REF"
+              fi
+
+              DATA_DIR="${DATA_DIR:-/j-jepa-vol/linformer_data/JetClass/kinematics_2m}"
+              SAVE_BASE="${SAVE_BASE:-/j-jepa-vol/jetclass_20m_retest_runs}"
+              mkdir -p "$SAVE_BASE"
+
+              test -f "$DATA_DIR/test/features.npy"
+              test -f "$DATA_DIR/test/vectors.npy"
+              test -f "$DATA_DIR/test/labels.npy"
+
+              cd "$REPO_DIR/scripts"
+              python3 -m py_compile \
+                train_jedi_linear.py \
+                train_transformer.py \
+                train_point_transformer.py \
+                train_linformer.py \
+                train_part.py
+
+              if [ "$MODEL_IDX" -eq 0 ]; then
+                TRAIN_TRIAL=$((13 + TRIAL_IDX))
+                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/jedi_linear/150/kt/custom/trial-${TRAIN_TRIAL}/model.weights.h5"
+                test -f "$CHECKPOINT"
+                echo "=== JetClass 20M retest: JEDI-Linear checkpoint trial-${TRAIN_TRIAL} ==="
+                python3 train_jedi_linear.py \
+                  --data_dir        "$DATA_DIR" \
+                  --save_dir        "$SAVE_BASE/jedi_linear/retest-from-trial-${TRAIN_TRIAL}" \
+                  --dataset         jetclass \
+                  --sort_by         kt \
+                  --preset          custom \
+                  --embedding_dim   20 \
+                  --num_blocks      2 \
+                  --channel_hidden  40 \
+                  --head_hidden     20 \
+                  --aggregation     mean \
+                  --batch_size      1024 \
+                  --test_only \
+                  --checkpoint_path "$CHECKPOINT"
+
+              elif [ "$MODEL_IDX" -eq 1 ]; then
+                TRAIN_TRIAL=$((12 + TRIAL_IDX))
+                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/transformer/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
+                test -f "$CHECKPOINT"
+                echo "=== JetClass 20M retest: Transformer checkpoint trial-${TRAIN_TRIAL} ==="
+                python3 train_transformer.py \
+                  --data_dir        "$DATA_DIR" \
+                  --save_dir        "$SAVE_BASE/transformer/retest-from-trial-${TRAIN_TRIAL}" \
+                  --dataset         jetclass \
+                  --sort_by         kt \
+                  --num_particles   150 \
+                  --d_model         8 \
+                  --d_ff            32 \
+                  --num_heads       2 \
+                  --batch_size      1024 \
+                  --test_only \
+                  --checkpoint_path "$CHECKPOINT"
+
+              elif [ "$MODEL_IDX" -eq 2 ]; then
+                TRAIN_TRIAL=$((9 + TRIAL_IDX))
+                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/ptv3_config1/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
+                test -f "$CHECKPOINT"
+                echo "=== JetClass 20M retest: PTv3 config1 checkpoint trial-${TRAIN_TRIAL} ==="
+                python3 train_point_transformer.py \
+                  --data_dir             "$DATA_DIR" \
+                  --save_dir             "$SAVE_BASE/ptv3_config1/retest-from-trial-${TRAIN_TRIAL}" \
+                  --dataset              jetclass \
+                  --sort_by              kt \
+                  --model_size           small \
+                  --enc_patch_sizes      10 \
+                  --ffn_activation       gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode learned_pool \
+                  --message_proj \
+                  --message_gated \
+                  --disable_pool \
+                  --batch_size           1024 \
+                  --test_only \
+                  --checkpoint_path      "$CHECKPOINT"
+
+              elif [ "$MODEL_IDX" -eq 3 ]; then
+                TRAIN_TRIAL=$((5 + TRIAL_IDX))
+                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/ptv3_config2/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
+                test -f "$CHECKPOINT"
+                echo "=== JetClass 20M retest: PTv3 config2 checkpoint trial-${TRAIN_TRIAL} ==="
+                python3 train_point_transformer.py \
+                  --data_dir             "$DATA_DIR" \
+                  --save_dir             "$SAVE_BASE/ptv3_config2/retest-from-trial-${TRAIN_TRIAL}" \
+                  --dataset              jetclass \
+                  --sort_by              kt \
+                  --model_size           small \
+                  --enc_patch_sizes      10 \
+                  --ffn_activation       gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode learned_pool \
+                  --message_proj \
+                  --no_message_gated \
+                  --batch_size           1024 \
+                  --test_only \
+                  --checkpoint_path      "$CHECKPOINT"
+
+              elif [ "$MODEL_IDX" -eq 4 ]; then
+                TRAIN_TRIAL=$((7 + TRIAL_IDX))
+                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/ptv3_config3/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
+                test -f "$CHECKPOINT"
+                echo "=== JetClass 20M retest: PTv3 config3 checkpoint trial-${TRAIN_TRIAL} ==="
+                python3 train_point_transformer.py \
+                  --data_dir             "$DATA_DIR" \
+                  --save_dir             "$SAVE_BASE/ptv3_config3/retest-from-trial-${TRAIN_TRIAL}" \
+                  --dataset              jetclass \
+                  --sort_by              kt \
+                  --model_size           small \
+                  --enc_patch_sizes      10 \
+                  --ffn_activation       gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode mean \
+                  --message_proj \
+                  --no_message_gated \
+                  --batch_size           1024 \
+                  --test_only \
+                  --checkpoint_path      "$CHECKPOINT"
+
+              elif [ "$MODEL_IDX" -eq 5 ]; then
+                TRAIN_TRIAL=$TRIAL_IDX
+                CHECKPOINT="/j-jepa-vol/1p3mFLOPs_runs/salt_jetclass/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
+                test -f "$CHECKPOINT"
+                echo "=== JetClass 20M retest: SAL-T checkpoint trial-${TRAIN_TRIAL} ==="
+                python3 train_linformer.py \
+                  --data_dir            "$DATA_DIR" \
+                  --save_dir            "$SAVE_BASE/salt_jetclass/retest-from-trial-${TRAIN_TRIAL}" \
+                  --dataset             jetclass \
+                  --sort_by             kt \
+                  --cluster_E \
+                  --cluster_F \
+                  --convolution \
+                  --conv_filter_heights 1 3 5 \
+                  --batch_size          1024 \
+                  --num_particles       150 \
+                  --d_model             20 \
+                  --d_ff                40 \
+                  --num_heads           4 \
+                  --proj_dim            4 \
+                  --use_cpe \
+                  --cpe_k               8 \
+                  --grid_size           0.2 \
+                  --num_layers          1 \
+                  --aggregation         max \
+                  --ffn_activation      relu \
+                  --test_only \
+                  --checkpoint_path     "$CHECKPOINT"
+
+              elif [ "$MODEL_IDX" -eq 6 ]; then
+                TRAIN_TRIAL=$TRIAL_IDX
+                CHECKPOINT="/j-jepa-vol/1p3mFLOPs_runs/part_d10_h2_pe4_jetclass/150/kt/trial-${TRAIN_TRIAL}/best_model.pt"
+                test -f "$CHECKPOINT"
+                echo "=== JetClass 20M retest: ParT checkpoint trial-${TRAIN_TRIAL} ==="
+                python3 train_part.py \
+                  --data_dir        "$DATA_DIR" \
+                  --save_dir        "$SAVE_BASE/part_d10_h2_pe4_jetclass/retest-from-trial-${TRAIN_TRIAL}" \
+                  --dataset         jetclass \
+                  --sort_by         kt \
+                  --num_particles   150 \
+                  --embed_dims      10 \
+                  --pair_embed_dims 4 \
+                  --pair_input_dim  4 \
+                  --num_heads       2 \
+                  --num_layers      1 \
+                  --num_cls_layers  1 \
+                  --batch_size      1024 \
+                  --test_only \
+                  --checkpoint_path "$CHECKPOINT"
+
+              elif [ "$MODEL_IDX" -eq 7 ]; then
+                TRAIN_TRIAL=$TRIAL_IDX
+                CHECKPOINT="/j-jepa-vol/1p3mFLOPs_runs/linformer_jetclass/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
+                test -f "$CHECKPOINT"
+                echo "=== JetClass 20M retest: Linformer checkpoint trial-${TRAIN_TRIAL} ==="
+                python3 train_linformer.py \
+                  --data_dir            "$DATA_DIR" \
+                  --save_dir            "$SAVE_BASE/linformer_jetclass/retest-from-trial-${TRAIN_TRIAL}" \
+                  --dataset             jetclass \
+                  --sort_by             kt \
+                  --batch_size          1024 \
+                  --num_particles       150 \
+                  --d_model             24 \
+                  --d_ff                32 \
+                  --num_heads           2 \
+                  --proj_dim            4 \
+                  --use_cpe \
+                  --cpe_k               8 \
+                  --grid_size           0.2 \
+                  --num_layers          1 \
+                  --aggregation         max \
+                  --ffn_activation      relu \
+                  --test_only \
+                  --checkpoint_path     "$CHECKPOINT"
+              fi
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"

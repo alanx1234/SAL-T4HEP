@@ -647,6 +647,7 @@ def main():
 				os.path.join(save_dir, "best.weights.h5"),
 				monitor="val_loss",
 				save_best_only=True,
+				save_weights_only=True,
 				verbose=1,
 		)
 		early = EarlyStopping(

@@ -86,7 +86,11 @@ spec:
                   --dataset       hls4ml \
                   --sort_by       kt \
                   --num_particles 150 \
-                  --flops_batch_size 1
+                  --flops_batch_size 1 \
+                  --schedule      none \
+                  --batch_size    32 \
+                  --num_epochs    1400 \
+                  --early_stopping_patience 40
 
               elif [ "$MODEL_IDX" -eq 1 ]; then
                 echo "=== HLS4ML: L-GATr unconstrained (index=$IDX) ==="
@@ -97,7 +101,11 @@ spec:
                   --dataset       hls4ml \
                   --sort_by       kt \
                   --num_particles 150 \
-                  --flops_batch_size 1
+                  --flops_batch_size 1 \
+                  --schedule      none \
+                  --batch_size    128 \
+                  --num_epochs    1400 \
+                  --early_stopping_patience 40
               fi
 
           volumeMounts:
