@@ -238,12 +238,13 @@ def get_flops_profiler(model, batch, device, forward_fn):
         return None
 
 
-def train_epoch(model, loader, criterion, optimizer, device, forward_fn):
+def train_epoch(model, loader, criterion, optimizer, device, forward_fn, log_every_batches=0, epoch=None):
     model.train()
     total_loss = 0.0
     correct = 0
     total = 0
-    for batch in loader:
+    n_batches = len(loader)
+    for batch_idx, batch in enumerate(loader, start=1):
         batch = tuple(t.to(device) for t in batch)
         labels = batch[-1]
         optimizer.zero_grad()
@@ -254,6 +255,18 @@ def train_epoch(model, loader, criterion, optimizer, device, forward_fn):
         total_loss += loss.item() * labels.size(0)
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += labels.size(0)
+        if log_every_batches and (
+            batch_idx == 1 or batch_idx % log_every_batches == 0 or batch_idx == n_batches
+        ):
+            prefix = f"Epoch {epoch} " if epoch is not None else ""
+            logging.info(
+                "%strain progress: batch %d/%d loss=%.4f acc=%.4f",
+                prefix,
+                batch_idx,
+                n_batches,
+                total_loss / total,
+                correct / total,
+            )
     return total_loss / total, correct / total
 
 

@@ -85,7 +85,8 @@ spec:
                   --save_dir      "$SAVE_BASE/lorentznet/$RUN_TAG" \
                   --dataset       hls4ml \
                   --sort_by       kt \
-                  --num_particles 150
+                  --num_particles 150 \
+                  --flops_batch_size 1
 
               elif [ "$MODEL_IDX" -eq 1 ]; then
                 echo "=== HLS4ML: L-GATr unconstrained (index=$IDX) ==="
@@ -95,7 +96,8 @@ spec:
                   --save_dir      "$SAVE_BASE/lgatr/$RUN_TAG" \
                   --dataset       hls4ml \
                   --sort_by       kt \
-                  --num_particles 150
+                  --num_particles 150 \
+                  --flops_batch_size 1
               fi
 
           volumeMounts:

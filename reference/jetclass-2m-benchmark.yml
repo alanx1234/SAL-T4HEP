@@ -198,6 +198,7 @@ spec:
                   --dataset       jetclass \
                   --sort_by       kt \
                   --num_particles 150 \
+                  --flops_batch_size 1 \
                   --schedule      none \
                   --batch_size    32 \
                   --num_epochs    500 \
@@ -212,6 +213,7 @@ spec:
                   --dataset       jetclass \
                   --sort_by       kt \
                   --num_particles 150 \
+                  --flops_batch_size 1 \
                   --schedule      none \
                   --batch_size    128 \
                   --num_epochs    500 \

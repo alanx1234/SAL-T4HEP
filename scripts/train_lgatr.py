@@ -66,6 +66,9 @@ def parse_args():
     p.add_argument("--beam_spurion", choices=["xyplane", "lightlike", "spacelike", "timelike", "none"], default="xyplane")
     p.add_argument("--no_time_spurion", action="store_true")
     p.add_argument("--checkpoint_blocks", action="store_true")
+    p.add_argument("--skip_flops", action="store_true", help="Skip PyTorch profiler FLOPs/MACs measurement")
+    p.add_argument("--flops_batch_size", type=int, default=1, help="Number of events to use for FLOPs profiling")
+    p.add_argument("--log_every_batches", type=int, default=500, help="Log training progress every N batches; 0 disables")
     p.add_argument("--test_only", action="store_true", help="Skip training and evaluate a checkpoint")
     p.add_argument("--checkpoint_path", default=None, help="Checkpoint path to load with --test_only")
     p.add_argument("--seed", type=int, default=42)
@@ -167,11 +170,17 @@ def main():
         )
         logging.info("Optimizer: Lion (local fallback)")
 
-    flops = get_flops_profiler(model, first_batch, device, forward_lgatr)
-    if flops:
-        flops_per_event = flops // len(first_batch[-1])
-        logging.info("FLOPs per inference: %d", flops_per_event)
-        logging.info("MACs per inference: %d", flops_per_event // 2)
+    if args.skip_flops:
+        logging.info("Skipping FLOPs profiling")
+    else:
+        flops_batch_size = max(1, min(args.flops_batch_size, len(first_batch[-1])))
+        flops_batch = tuple(t[:flops_batch_size] for t in first_batch)
+        logging.info("Profiling FLOPs with batch_size=%d", flops_batch_size)
+        flops = get_flops_profiler(model, flops_batch, device, forward_lgatr)
+        if flops:
+            flops_per_event = flops // flops_batch_size
+            logging.info("FLOPs per inference: %d", flops_per_event)
+            logging.info("MACs per inference: %d", flops_per_event // 2)
 
     if args.test_only:
         logging.info("Loading checkpoint: %s", args.checkpoint_path)
@@ -208,7 +217,16 @@ def main():
             args.lr,
         )
         for _ in range(stage_epochs):
-            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, forward_lgatr)
+            train_loss, train_acc = train_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                device,
+                forward_lgatr,
+                log_every_batches=args.log_every_batches,
+                epoch=current_epoch + 1,
+            )
             val_loss, val_acc = validate(model, val_loader, criterion, device, forward_lgatr)
             current_epoch += 1
             histories["train_loss"].append(train_loss)
