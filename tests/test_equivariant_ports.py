@@ -138,6 +138,72 @@ def test_lgatr_default_forward_shape_when_dependency_available():
     assert out.shape == (2, 5)
 
 
+def test_part_chunked_testing_runs_on_memmapped_jetclass(tmp_path):
+    from models.parT import ParticleTransformer
+    from scripts.train_part import run_testing
+
+    rng = np.random.default_rng(19)
+    data_dir = tmp_path / "jetclass"
+    test_dir = data_dir / "test"
+    test_dir.mkdir(parents=True)
+
+    n_events = 20
+    n_particles = 12
+    labels_idx = np.arange(n_events) % 10
+    labels = np.eye(10, dtype=np.float32)[labels_idx]
+    pt = rng.uniform(0.1, 2.0, size=(n_events, n_particles)).astype("float32")
+    eta = rng.normal(0.0, 0.5, size=(n_events, n_particles)).astype("float32")
+    phi = rng.uniform(-np.pi, np.pi, size=(n_events, n_particles)).astype("float32")
+    features = np.stack([pt, eta, phi], axis=1)
+    np.save(test_dir / "features.npy", features)
+    np.save(test_dir / "labels.npy", labels)
+
+    block_params = {
+        "dropout": 0.0,
+        "attn_dropout": 0.0,
+        "activation_dropout": 0.0,
+        "scale_fc": False,
+        "scale_attn": False,
+        "scale_heads": False,
+        "scale_resids": False,
+    }
+    model = ParticleTransformer(
+        input_dim=3,
+        num_classes=10,
+        pair_input_dim=0,
+        pair_extra_dim=0,
+        remove_self_pair=True,
+        use_pre_activation_pair=True,
+        embed_dims=[4],
+        pair_embed_dims=None,
+        num_heads=1,
+        num_layers=1,
+        num_cls_layers=1,
+        block_params=block_params,
+        cls_block_params=block_params,
+        fc_params=[],
+        activation="gelu",
+        trim=False,
+        for_inference=False,
+    )
+    save_dir = tmp_path / "part_results"
+    save_dir.mkdir()
+
+    run_testing(
+        model,
+        "jetclass",
+        str(data_dir),
+        str(save_dir),
+        "kt",
+        batch_size=7,
+        num_particles=n_particles,
+        device=torch.device("cpu"),
+    )
+
+    log_artifact = save_dir / "roc_curves.png"
+    assert log_artifact.exists()
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec("awkward") is None or importlib.util.find_spec("uproot") is None,
     reason="JetClass ROOT processing dependencies not installed",

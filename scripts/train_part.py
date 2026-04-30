@@ -138,21 +138,21 @@ def load_data(dataset, data_dir, num_particles, val_split=0.2):
     return x_train, x_val, y_train, y_val
 
 
-def load_test_data(dataset, data_dir, num_particles):
+def load_test_data(dataset, data_dir, num_particles, mmap_mode=None):
     """Load test data following the project's conventions."""
     if dataset == "hls4ml":
-        x = np.load(os.path.join(data_dir, f"x_val_robust_{num_particles}const_ptetaphi.npy"))
-        y = np.load(os.path.join(data_dir, f"y_val_robust_{num_particles}const_ptetaphi.npy"))
+        x = np.load(os.path.join(data_dir, f"x_val_robust_{num_particles}const_ptetaphi.npy"), mmap_mode=mmap_mode)
+        y = np.load(os.path.join(data_dir, f"y_val_robust_{num_particles}const_ptetaphi.npy"), mmap_mode=mmap_mode)
     elif dataset == "jetclass":
-        x = np.load(os.path.join(data_dir, "test/features.npy"))
-        y = np.load(os.path.join(data_dir, "test/labels.npy"))
+        x = np.load(os.path.join(data_dir, "test/features.npy"), mmap_mode=mmap_mode)
+        y = np.load(os.path.join(data_dir, "test/labels.npy"), mmap_mode=mmap_mode)
         x = x.transpose(0, 2, 1)
     elif dataset == "top":
-        x = np.load(os.path.join(data_dir, "test/features.npy"))
-        y = np.load(os.path.join(data_dir, "test/labels.npy"))
+        x = np.load(os.path.join(data_dir, "test/features.npy"), mmap_mode=mmap_mode)
+        y = np.load(os.path.join(data_dir, "test/labels.npy"), mmap_mode=mmap_mode)
     elif dataset == "QG":
-        x = np.load(os.path.join(data_dir, "test/features.npy"))
-        y = np.load(os.path.join(data_dir, "test/labels.npy"))
+        x = np.load(os.path.join(data_dir, "test/features.npy"), mmap_mode=mmap_mode)
+        y = np.load(os.path.join(data_dir, "test/labels.npy"), mmap_mode=mmap_mode)
     return x, y
 
 
@@ -255,16 +255,22 @@ def get_flops_profiler(model, x, v, mask, device):
 def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, device):
     logging.info("Starting testing phase...")
 
-    x_test, y_test = load_test_data(dataset, data_dir, num_particles)
+    x_test, y_test = load_test_data(dataset, data_dir, num_particles, mmap_mode="r")
     logging.info("Loaded TEST: x=%s, y=%s", x_test.shape, y_test.shape)
 
-    x_test = apply_sorting(x_test, sort_by)
-    logging.info("Applied '%s' sorting to TEST set", sort_by)
+    def prepare_test_chunk(start, end):
+        x_chunk = np.asarray(x_test[start:end])
+        x_chunk = apply_sorting(x_chunk, sort_by)
+        x_feat, v, mask = prepare_part_inputs(x_chunk)
+        return (
+            torch.from_numpy(x_feat).to(device),
+            torch.from_numpy(v).to(device),
+            torch.from_numpy(mask).to(device),
+        )
 
-    x_feat, v, mask = prepare_part_inputs(x_test)
-    x_feat_t = torch.FloatTensor(x_feat).to(device)
-    v_t = torch.FloatTensor(v).to(device)
-    mask_t = torch.FloatTensor(mask).to(device)
+    logging.info("Applied '%s' sorting to TEST set in chunks", sort_by)
+    first_chunk_end = min(batch_size, len(x_test))
+    x_feat_t, v_t, mask_t = prepare_test_chunk(0, first_chunk_end)
 
     # FLOPs (single sample)
     flops = get_flops_profiler(model, x_feat_t[:1], v_t[:1], mask_t[:1], device)
@@ -275,25 +281,25 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
     # Timing
     model.eval()
     with torch.inference_mode():
-        _ = model(x_feat_t[:batch_size], v=v_t[:batch_size], mask=mask_t[:batch_size])
+        _ = model(x_feat_t, v=v_t, mask=mask_t)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     times = []
     for _ in range(20):
         t0 = time.perf_counter()
         with torch.inference_mode():
-            _ = model(x_feat_t[:batch_size], v=v_t[:batch_size], mask=mask_t[:batch_size])
+            _ = model(x_feat_t, v=v_t, mask=mask_t)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
-    avg_ns = np.mean(times) / batch_size * 1e9
+    avg_ns = np.mean(times) / first_chunk_end * 1e9
     logging.info("Avg inference time/event: %.2f ns", avg_ns)
 
     # GPU memory
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
         with torch.inference_mode():
-            _ = model(x_feat_t[:batch_size], v=v_t[:batch_size], mask=mask_t[:batch_size])
+            _ = model(x_feat_t, v=v_t, mask=mask_t)
         torch.cuda.synchronize()
         peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
         logging.info("GPU peak memory: %.1f MB", peak_mb)
@@ -304,7 +310,8 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
     with torch.no_grad():
         for i in range(0, len(x_test), batch_size):
             end = min(i + batch_size, len(x_test))
-            out = model(x_feat_t[i:end], v=v_t[i:end], mask=mask_t[i:end])
+            x_feat_t, v_t, mask_t = prepare_test_chunk(i, end)
+            out = model(x_feat_t, v=v_t, mask=mask_t)
             all_preds.append(torch.softmax(out, dim=1).cpu().numpy())
     preds = np.vstack(all_preds)
 
