@@ -125,6 +125,17 @@ def test_lgatr_forward_shape_when_dependency_available():
     assert out.shape == (2, 5)
 
 
+@pytest.mark.skipif(importlib.util.find_spec("lgatr") is None, reason="lgatr package not installed")
+def test_lgatr_default_forward_shape_when_dependency_available():
+    from models.lgatr_wrapper import LGATrJetClassifier
+
+    _, p4, _ = make_toy_inputs(batch_size=2, num_particles=150, num_classes=5)
+    mask = torch.ones(2, 150, dtype=torch.bool)
+    model = LGATrJetClassifier(num_classes=5)
+    out = model(torch.from_numpy(p4), mask=mask)
+    assert out.shape == (2, 5)
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec("awkward") is None or importlib.util.find_spec("uproot") is None,
     reason="JetClass ROOT processing dependencies not installed",

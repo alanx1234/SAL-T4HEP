@@ -205,7 +205,7 @@ spec:
 
               elif [ "$MODEL_IDX" -eq 6 ]; then
                 echo "=== JetClass 2M: L-GATr unconstrained (index=$IDX) ==="
-                python3 -m pip install --no-cache-dir lgatr
+                python3 -m pip install --no-cache-dir lgatr==1.4.4
                 python3 train_lgatr.py \
                   --data_dir      "$DATA_DIR" \
                   --save_dir      "$SAVE_BASE/lgatr/$RUN_TAG" \

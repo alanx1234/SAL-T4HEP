@@ -214,11 +214,11 @@ def lorentz_scalars_from_p4(p4):
 def get_flops_profiler(model, batch, device, forward_fn):
     model.eval().to(device)
     batch = tuple(t.to(device) for t in batch)
-    with torch.no_grad():
-        _ = forward_fn(model, batch)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
     try:
+        with torch.no_grad():
+            _ = forward_fn(model, batch)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,

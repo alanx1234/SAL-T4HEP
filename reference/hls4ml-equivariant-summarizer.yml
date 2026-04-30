@@ -78,23 +78,32 @@ spec:
                       return ""
                   return f"{sum(vals) / len(vals):.{nd_mean}f} +/- {sd(vals):.{nd_sd}f}"
 
-              def trial_dirs(model_dir):
-                  dirs = []
+              def trial_logs(model_dir):
+                  complete = []
+                  incomplete = []
                   for p in model_dir.rglob("trial-*"):
-                      if p.is_dir() and (p / "train.log").is_file():
-                          dirs.append(p)
-                  dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                  return dirs[:TRIALS]
+                      log_path = p / "train.log"
+                      if not (p.is_dir() and log_path.is_file()):
+                          continue
+                      text = log_path.read_text(errors="ignore")
+                      if RX_TEST_ACC.search(text) and RX_ROC_AUC.search(text):
+                          complete.append((p, text))
+                      else:
+                          incomplete.append(p)
+                  complete.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+                  incomplete.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                  return complete[:TRIALS], incomplete
 
               rows = []
               for model in MODELS:
-                  dirs = trial_dirs(SAVE_BASE / model)
-                  if len(dirs) < TRIALS:
-                      print(f"[WARN] {model}: found {len(dirs)}/{TRIALS} trials under {SAVE_BASE / model}")
+                  entries, incomplete = trial_logs(SAVE_BASE / model)
+                  if incomplete:
+                      print(f"[WARN] {model}: ignored {len(incomplete)} incomplete trial logs under {SAVE_BASE / model}")
+                  if len(entries) < TRIALS:
+                      print(f"[WARN] {model}: found {len(entries)}/{TRIALS} complete trials under {SAVE_BASE / model}")
                       continue
                   parsed = []
-                  for d in dirs:
-                      text = (d / "train.log").read_text(errors="ignore")
+                  for d, text in entries:
                       br = {}
                       for label, value in RX_BR.findall(text):
                           br[label.lower()] = parse_float(value)
