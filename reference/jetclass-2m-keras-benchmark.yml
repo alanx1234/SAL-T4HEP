@@ -1,11 +1,11 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: alan-jetclass-2m-benchmark
+  name: alan-jetclass-2m-keras-benchmark
   namespace: cms-ml
 spec:
-  completions: 30
-  parallelism: 30
+  completions: 21
+  parallelism: 21
   completionMode: Indexed
   backoffLimit: 4
   template:
@@ -50,17 +50,14 @@ spec:
               # indices 6-8:    PTv3 config1 trials 0,1,2
               # indices 9-11:   PTv3 config2 trials 0,1,2
               # indices 12-14:  PTv3 config3 trials 0,1,2
-              # indices 15-17:  LorentzNet unconstrained trials 0,1,2
-              # indices 18-20:  L-GATr unconstrained trials 0,1,2
-              # indices 21-23:  SAL-T 1.3M-FLOPs config trials 0,1,2
-              # indices 24-26:  ParT 1.3M-FLOPs config trials 0,1,2
-              # indices 27-29:  Linformer 1.3M-FLOPs config trials 0,1,2
+              # indices 15-17:  SAL-T 1.3M-FLOPs config trials 0,1,2
+              # indices 18-20:  Linformer 1.3M-FLOPs config trials 0,1,2
 
               IDX=$JOB_COMPLETION_INDEX
               MODEL_IDX=$((IDX / 3))
               TRIAL_IDX=$((IDX % 3))
 
-              REPO_DIR="/tmp/sal_t_jetclass_2m_benchmark"
+              REPO_DIR="/tmp/sal_t_jetclass_2m_keras_benchmark"
               REPO_REF="${REPO_REF:-iclr}"
               if [ -d "$REPO_DIR/.git" ]; then
                 cd "$REPO_DIR"
@@ -75,7 +72,7 @@ spec:
 
               DATA_DIR="${DATA_DIR:-/j-jepa-vol/linformer_data/JetClass/kinematics_2m}"
               SAVE_BASE="${SAVE_BASE:-/j-jepa-vol/jetclass_2m_benchmark_runs}"
-              RUN_TAG="idx-${IDX}-trial-${TRIAL_IDX}"
+              RUN_TAG="keras-idx-${IDX}-trial-${TRIAL_IDX}"
               mkdir -p "$SAVE_BASE"
 
               test -f "$DATA_DIR/train/features.npy"
@@ -93,10 +90,7 @@ spec:
                 train_jedi_linear.py \
                 train_transformer.py \
                 train_point_transformer.py \
-                train_lorentznet.py \
-                train_lgatr.py \
-                train_linformer.py \
-                train_part.py
+                train_linformer.py
 
               if [ "$MODEL_IDX" -eq 0 ]; then
                 echo "=== JetClass 2M: JEDI-Linear (index=$IDX) ==="
@@ -191,33 +185,6 @@ spec:
                   --early_stopping_patience 50
 
               elif [ "$MODEL_IDX" -eq 5 ]; then
-                echo "=== JetClass 2M: LorentzNet unconstrained (index=$IDX) ==="
-                python3 train_lorentznet.py \
-                  --data_dir      "$DATA_DIR" \
-                  --save_dir      "$SAVE_BASE/lorentznet/$RUN_TAG" \
-                  --dataset       jetclass \
-                  --sort_by       kt \
-                  --num_particles 150 \
-                  --schedule      none \
-                  --batch_size    32 \
-                  --num_epochs    500 \
-                  --early_stopping_patience 50
-
-              elif [ "$MODEL_IDX" -eq 6 ]; then
-                echo "=== JetClass 2M: L-GATr unconstrained (index=$IDX) ==="
-                python3 -m pip install --no-cache-dir lgatr==1.4.4
-                python3 train_lgatr.py \
-                  --data_dir      "$DATA_DIR" \
-                  --save_dir      "$SAVE_BASE/lgatr/$RUN_TAG" \
-                  --dataset       jetclass \
-                  --sort_by       kt \
-                  --num_particles 150 \
-                  --schedule      none \
-                  --batch_size    128 \
-                  --num_epochs    500 \
-                  --early_stopping_patience 50
-
-              elif [ "$MODEL_IDX" -eq 7 ]; then
                 echo "=== JetClass 2M: SAL-T 1.3M-FLOPs config (index=$IDX) ==="
                 python3 train_linformer.py \
                   --data_dir            "$DATA_DIR" \
@@ -244,26 +211,7 @@ spec:
                   --aggregation         max \
                   --ffn_activation      relu
 
-              elif [ "$MODEL_IDX" -eq 8 ]; then
-                echo "=== JetClass 2M: ParT 1.3M-FLOPs config (index=$IDX) ==="
-                python3 train_part.py \
-                  --data_dir        "$DATA_DIR" \
-                  --save_dir        "$SAVE_BASE/part_d10_h2_pe4_jetclass/$RUN_TAG" \
-                  --dataset         jetclass \
-                  --sort_by         kt \
-                  --num_particles   150 \
-                  --embed_dims      10 \
-                  --pair_embed_dims 4 \
-                  --pair_input_dim  4 \
-                  --num_heads       2 \
-                  --num_layers      1 \
-                  --num_cls_layers  1 \
-                  --schedule        none \
-                  --batch_size      1024 \
-                  --num_epochs      500 \
-                  --early_stopping_patience 50
-
-              elif [ "$MODEL_IDX" -eq 9 ]; then
+              elif [ "$MODEL_IDX" -eq 6 ]; then
                 echo "=== JetClass 2M: Linformer 1.3M-FLOPs config (index=$IDX) ==="
                 python3 train_linformer.py \
                   --data_dir            "$DATA_DIR" \

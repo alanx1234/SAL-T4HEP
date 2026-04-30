@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 # import model builders
 from models.PointTransformerV3TF import build_ptv3_jet_classifier, build_jedi_ptv3_hybrid
 from models.PointTransformer_serialized import build_ptv3_serialized_jet_classifier
+from scripts.keras_chunked_testing import predict_in_chunks
 
 
 def parse_training_schedule(schedule, batch_size, num_epochs):
@@ -181,62 +182,72 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 		# load test set
 		if dataset == "hls4ml":
 				x_test = np.load(
-						os.path.join(data_dir, f"x_val_robust_{num_particles}const_ptetaphi.npy")
+						os.path.join(data_dir, f"x_val_robust_{num_particles}const_ptetaphi.npy"),
+						mmap_mode="r",
 				)
 				y_test = np.load(
-						os.path.join(data_dir, f"y_val_robust_{num_particles}const_ptetaphi.npy")
+						os.path.join(data_dir, f"y_val_robust_{num_particles}const_ptetaphi.npy"),
+						mmap_mode="r",
 				)
 		else:  # jetclass, top, or QG
-				x_test = np.load(os.path.join(data_dir, "test/features.npy"))
-				y_test = np.load(os.path.join(data_dir, "test/labels.npy"))
+				x_test = np.load(os.path.join(data_dir, "test/features.npy"), mmap_mode="r")
+				y_test = np.load(os.path.join(data_dir, "test/labels.npy"), mmap_mode="r")
 		logging.info(
 				"Loaded TEST arrays for %s: %s, %s", dataset, x_test.shape, y_test.shape
 		)
 
-		if dataset == "jetclass":
-				x_test = x_test.transpose(0, 2, 1)
-
-		# sorting for test
-		x_test = apply_sorting(x_test, sort_by, grid_size=morton_grid_size)
-		logging.info("Applied '%s' sorting to TEST set", sort_by)
-
-		# truncate to top-k if requested
-		if num_particles_truncate is not None:
-				x_test = x_test[:, :num_particles_truncate, :]
-				logging.info("Truncated TEST set to top-%d particles", num_particles_truncate)
-
-		# zero-pad to nearest multiple of patch size if needed
+		n_test = x_test.shape[0]
+		pad_len = 0
 		if enc_patch_sizes is not None:
 				max_patch = max(enc_patch_sizes)
-				remainder = x_test.shape[1] % max_patch
+				test_num_particles = num_particles_truncate if num_particles_truncate is not None else (
+						x_test.shape[2] if dataset == "jetclass" else x_test.shape[1]
+				)
+				remainder = test_num_particles % max_patch
 				if remainder != 0:
 						pad_len = max_patch - remainder
-						x_test = np.pad(x_test, ((0,0),(0,pad_len),(0,0)))
-						logging.info("Padded TEST set to %d particles for patch_size=%d", x_test.shape[1], max_patch)
+
+		def prepare_test_chunk(start, end):
+				x_chunk = np.asarray(x_test[start:end])
+				if dataset == "jetclass":
+						x_chunk = x_chunk.transpose(0, 2, 1)
+				x_chunk = apply_sorting(x_chunk, sort_by, grid_size=morton_grid_size)
+				if num_particles_truncate is not None:
+						x_chunk = x_chunk[:, :num_particles_truncate, :]
+				if pad_len:
+						x_chunk = np.pad(x_chunk, ((0,0),(0,pad_len),(0,0)))
+				return x_chunk.astype(np.float32, copy=False)
+
+		x_sample = prepare_test_chunk(0, min(batch_size, n_test))
+		logging.info("Applied '%s' sorting to TEST set", sort_by)
+		if num_particles_truncate is not None:
+				logging.info("Truncated TEST set to top-%d particles", num_particles_truncate)
+		if pad_len:
+				logging.info("Padded TEST set to %d particles for patch_size=%d", x_sample.shape[1], max_patch)
 
 		# flops & macs
-		num_p, feat_d = x_test.shape[1], x_test.shape[2]
+		num_p, feat_d = x_sample.shape[1], x_sample.shape[2]
 		flops = get_flops(model, (1, num_p, feat_d))
 		macs = flops // 2
 		logging.info("FLOPs per inference: %d", flops)
 		logging.info("MACs per inference: %d", macs)
 
 		# timing
-		_ = model.predict(x_test[:batch_size], batch_size=batch_size)
+		_ = model.predict(x_sample, batch_size=batch_size)
 		times = []
 		for _ in range(20):
 				t0 = time.perf_counter()
-				_ = model.predict(x_test[:batch_size], batch_size=batch_size)
+				_ = model.predict(x_sample, batch_size=batch_size)
 				times.append(time.perf_counter() - t0)
-		avg_ns = np.mean(times) / batch_size * 1e9
+		avg_ns = np.mean(times) / x_sample.shape[0] * 1e9
 		logging.info("Avg inference time/event: %.2f ns", avg_ns)
 
 		# GPU memory
-		curr, peak = profile_gpu_memory_during_inference(model, x_test[:batch_size])
+		curr, peak = profile_gpu_memory_during_inference(model, x_sample)
 		logging.info("GPU memory current: %.1f MB, peak: %.1f MB", curr, peak)
 
 		# metrics
-		preds = model.predict(x_test, batch_size=batch_size)
+		preds = predict_in_chunks(model, n_test, batch_size, prepare_test_chunk)
 		if dataset == "top" or dataset == "QG":
 				acc = accuracy_score(y_test, (preds.ravel() > 0.5).astype(int))
 				auc_m = roc_auc_score(y_test, preds.ravel())

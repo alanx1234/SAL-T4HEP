@@ -106,7 +106,8 @@ spec:
                 --num_val 200000 \
                 --num_test 20000000 \
                 --shuffle_seed 42 \
-                --shuffle_chunk_size 50000
+                --shuffle_chunk_size 50000 \
+                --no_shuffle_test
 
               python3 -c "import os, numpy as np; out='$OUTPUT_DIR'; \
               [print(split, np.load(os.path.join(out, split, 'features.npy'), mmap_mode='r').shape, np.load(os.path.join(out, split, 'vectors.npy'), mmap_mode='r').shape, np.load(os.path.join(out, split, 'labels.npy'), mmap_mode='r').shape) for split in ('train', 'val', 'test')]"

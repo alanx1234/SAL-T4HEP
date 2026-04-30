@@ -1,4 +1,5 @@
 import importlib.util
+import importlib
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -202,6 +203,143 @@ def test_part_chunked_testing_runs_on_memmapped_jetclass(tmp_path):
 
     log_artifact = save_dir / "roc_curves.png"
     assert log_artifact.exists()
+
+
+def test_keras_predict_in_chunks_uses_bounded_chunks(monkeypatch):
+    from scripts.keras_chunked_testing import predict_in_chunks
+
+    class RecordingModel:
+        def __init__(self):
+            self.seen = []
+
+        def predict(self, x, batch_size=None, verbose=None):
+            self.seen.append(x.shape[0])
+            return np.ones((x.shape[0], 3), dtype=np.float32)
+
+    monkeypatch.setenv("TEST_CHUNK_SIZE", "5")
+    model = RecordingModel()
+
+    def prepare_chunk(start, end):
+        return np.zeros((end - start, 4, 2), dtype=np.float32)
+
+    preds = predict_in_chunks(model, n_events=23, batch_size=3, prepare_chunk=prepare_chunk)
+
+    assert preds.shape == (23, 3)
+    assert model.seen == [5, 5, 5, 5, 3]
+
+
+class FakeKerasClassifier:
+    def __init__(self, num_classes=10):
+        self.num_classes = num_classes
+        self.predict_batch_sizes = []
+        self.predict_particle_counts = []
+
+    def predict(self, x, batch_size=None, verbose=None):
+        x = np.asarray(x)
+        self.predict_batch_sizes.append(x.shape[0])
+        self.predict_particle_counts.append(x.shape[1])
+        score = x.sum(axis=(1, 2))
+        logits = np.stack(
+            [np.sin(score + 0.37 * cls) + 0.05 * cls for cls in range(self.num_classes)],
+            axis=1,
+        )
+        logits -= logits.max(axis=1, keepdims=True)
+        probs = np.exp(logits)
+        return (probs / probs.sum(axis=1, keepdims=True)).astype("float32")
+
+
+def import_optional_training_module(module_name):
+    pytest.importorskip("tensorflow")
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        pytest.skip(f"{module_name} dependency unavailable: {exc}")
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "scripts.train_jedi_linear",
+        "scripts.train_transformer",
+        "scripts.train_linformer",
+    ],
+)
+def test_keras_training_scripts_chunk_jetclass_testing(tmp_path, monkeypatch, module_name):
+    module = import_optional_training_module(module_name)
+    monkeypatch.setenv("TEST_CHUNK_SIZE", "7")
+    monkeypatch.setattr(module, "get_flops", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(module, "profile_gpu_memory_during_inference", lambda *args, **kwargs: (0.0, 0.0))
+
+    rng = np.random.default_rng(31)
+    data_dir = tmp_path / "jetclass"
+    test_dir = data_dir / "test"
+    test_dir.mkdir(parents=True)
+    n_events = 31
+    n_particles = 9
+    labels = np.eye(10, dtype=np.float32)[np.arange(n_events) % 10]
+    features = rng.normal(size=(n_events, 3, n_particles)).astype("float32")
+    features[:, 0, :] = np.abs(features[:, 0, :]) + 0.1
+    np.save(test_dir / "features.npy", features)
+    np.save(test_dir / "labels.npy", labels)
+
+    model = FakeKerasClassifier(num_classes=10)
+    save_dir = tmp_path / module_name.rsplit(".", 1)[-1]
+    save_dir.mkdir()
+
+    module.run_testing(
+        model,
+        "jetclass",
+        str(data_dir),
+        str(save_dir),
+        "kt",
+        batch_size=4,
+        num_particles=n_particles,
+    )
+
+    assert save_dir.joinpath("roc_curves.png").exists()
+    assert 7 in model.predict_batch_sizes
+    assert max(model.predict_batch_sizes) <= 7
+
+
+def test_point_transformer_chunked_testing_handles_padding(tmp_path, monkeypatch):
+    module = import_optional_training_module("scripts.train_point_transformer")
+    monkeypatch.setenv("TEST_CHUNK_SIZE", "7")
+    monkeypatch.setattr(module, "get_flops", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(module, "profile_gpu_memory_during_inference", lambda *args, **kwargs: (0.0, 0.0))
+
+    rng = np.random.default_rng(37)
+    data_dir = tmp_path / "jetclass"
+    test_dir = data_dir / "test"
+    test_dir.mkdir(parents=True)
+    n_events = 31
+    n_particles = 9
+    labels = np.eye(10, dtype=np.float32)[np.arange(n_events) % 10]
+    features = rng.normal(size=(n_events, 3, n_particles)).astype("float32")
+    features[:, 0, :] = np.abs(features[:, 0, :]) + 0.1
+    np.save(test_dir / "features.npy", features)
+    np.save(test_dir / "labels.npy", labels)
+
+    model = FakeKerasClassifier(num_classes=10)
+    save_dir = tmp_path / "ptv3_results"
+    save_dir.mkdir()
+
+    module.run_testing(
+        model,
+        "jetclass",
+        str(data_dir),
+        str(save_dir),
+        "kt",
+        batch_size=4,
+        num_particles=n_particles,
+        morton_grid_size=0.2,
+        num_particles_truncate=7,
+        enc_patch_sizes=[4],
+    )
+
+    assert save_dir.joinpath("roc_curves.png").exists()
+    assert 7 in model.predict_batch_sizes
+    assert max(model.predict_batch_sizes) <= 7
+    assert set(model.predict_particle_counts) == {8}
 
 
 @pytest.mark.skipif(

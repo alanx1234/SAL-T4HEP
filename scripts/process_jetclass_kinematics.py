@@ -200,12 +200,16 @@ def shuffle_array(path, permutation, chunk_size):
         dtype=src.dtype,
         shape=src.shape,
     )
+    total = len(permutation)
+    logging.info("Shuffling %s: %d rows, chunk_size=%d", path.name, total, chunk_size)
     for start in range(0, len(permutation), chunk_size):
         end = min(start + chunk_size, len(permutation))
         dst[start:end] = src[permutation[start:end]]
+        logging.info("Shuffling %s: wrote %d/%d", path.name, end, total)
     dst.flush()
     del src, dst
     os.replace(tmp_path, path)
+    logging.info("Finished shuffling %s", path.name)
 
 
 def shuffle_split(output_dir, split, seed, chunk_size):
@@ -232,6 +236,7 @@ def parse_args():
     p.add_argument("--shuffle_seed", type=int, default=42)
     p.add_argument("--shuffle_chunk_size", type=int, default=50_000)
     p.add_argument("--no_shuffle", action="store_true")
+    p.add_argument("--no_shuffle_test", action="store_true", help="Shuffle train/val but leave the test split in write order")
     return p.parse_args()
 
 
@@ -245,7 +250,10 @@ def main():
     if not args.no_shuffle:
         shuffle_split(args.output_dir, "train", args.shuffle_seed + 0, args.shuffle_chunk_size)
         shuffle_split(args.output_dir, "val", args.shuffle_seed + 1, args.shuffle_chunk_size)
-        shuffle_split(args.output_dir, "test", args.shuffle_seed + 2, args.shuffle_chunk_size)
+        if args.no_shuffle_test:
+            logging.info("Skipping test split shuffle")
+        else:
+            shuffle_split(args.output_dir, "test", args.shuffle_seed + 2, args.shuffle_chunk_size)
 
 
 if __name__ == "__main__":
