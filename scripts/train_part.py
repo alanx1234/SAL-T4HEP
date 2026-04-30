@@ -366,7 +366,7 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
         for i, lab in enumerate(labels[1:], start=1):
             if dataset == "jetclass":
                 mask_bg = np.ones_like(y_test[:, 0], dtype=bool)
-                bin_y = (y_test[mask_bg, i] == i).astype(int)
+                bin_y = (y_test[mask_bg, i] == 1).astype(int)
             else:
                 mask_bg = (y_test[:, 0] == 1) | (y_test[:, 1] == 1) | (y_test[:, i] == 1)
                 bin_y = (y_test[mask_bg, i] == 1).astype(int)

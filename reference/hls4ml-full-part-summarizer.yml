@@ -1,0 +1,175 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-hls4ml-full-part-summarize
+  namespace: cms-ml
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: summarize
+          image: python:3.11-slim
+          command: ["/bin/bash", "-lc"]
+          env:
+            - name: PYTHONIOENCODING
+              value: "utf-8"
+            - name: LC_ALL
+              value: "C.UTF-8"
+            - name: SAVE_BASE
+              value: "/j-jepa-vol/1p3mFLOPs_runs"
+            - name: MODEL_DIR
+              value: "full_part_hls4ml"
+            - name: TRIALS
+              value: "3"
+          args:
+            - |
+              set -euo pipefail
+
+              cat > /tmp/summarize_hls4ml_full_part.py << 'PY'
+              from __future__ import annotations
+              import math
+              import os
+              import re
+              import sys
+              from pathlib import Path
+
+              sys.stdout.reconfigure(encoding="utf-8")
+
+              SAVE_BASE = Path(os.environ["SAVE_BASE"])
+              MODEL_DIR = os.environ.get("MODEL_DIR", "full_part_hls4ml")
+              TRIALS = int(os.environ.get("TRIALS", "3"))
+
+              RX_TEST_ACC = re.compile(r"Test\s*Accuracy:\s*([0-9]*\.?[0-9]+)", re.I)
+              RX_ROC_AUC = re.compile(r"ROC\s*AUC:\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
+              RX_TOTAL_PARAMS = re.compile(r"Total\s+params:\s*([0-9]+)", re.I)
+              RX_FLOPS = re.compile(r"FLOPs\s*per\s*inference:\s*([0-9]+)", re.I)
+              RX_BR = re.compile(r"Bg\s*rejection@0\.8\s*(W|Z|t)\s*:\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
+              RX_AVG_BR = re.compile(r"Avg\s+bg\s+rejection@0\.8:\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
+
+              def last(rx, text, cast=float):
+                  hits = rx.findall(text)
+                  if not hits:
+                      return None
+                  hit = hits[-1]
+                  if isinstance(hit, tuple):
+                      hit = hit[0]
+                  try:
+                      return cast(hit)
+                  except Exception:
+                      return None
+
+              def parse_float(value):
+                  try:
+                      return float(value)
+                  except Exception:
+                      return None
+
+              def sd(xs):
+                  xs = [x for x in xs if x is not None and math.isfinite(x)]
+                  if len(xs) <= 1:
+                      return 0.0
+                  mu = sum(xs) / len(xs)
+                  return math.sqrt(sum((x - mu) ** 2 for x in xs) / (len(xs) - 1))
+
+              def fmt(xs, nd_mean=4, nd_sd=4, scale=1.0):
+                  vals = [x * scale for x in xs if x is not None and math.isfinite(x)]
+                  if not vals:
+                      return ""
+                  return f"{sum(vals) / len(vals):.{nd_mean}f} +/- {sd(vals):.{nd_sd}f}"
+
+              def trial_logs(model_dir):
+                  complete = []
+                  incomplete = []
+                  for p in model_dir.rglob("trial-*"):
+                      log_path = p / "train.log"
+                      if not (p.is_dir() and log_path.is_file()):
+                          continue
+                      text = log_path.read_text(errors="ignore")
+                      if RX_TEST_ACC.search(text) and RX_ROC_AUC.search(text):
+                          complete.append((p, text))
+                      else:
+                          incomplete.append(p)
+                  complete.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+                  incomplete.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                  return complete[:TRIALS], incomplete
+
+              entries, incomplete = trial_logs(SAVE_BASE / MODEL_DIR)
+              if incomplete:
+                  print(f"[WARN] ignored {len(incomplete)} incomplete trial logs under {SAVE_BASE / MODEL_DIR}")
+              if len(entries) < TRIALS:
+                  print(f"[WARN] found {len(entries)}/{TRIALS} complete trials under {SAVE_BASE / MODEL_DIR}")
+              if not entries:
+                  raise SystemExit("[FATAL] No complete full-ParT HLS4ML trials found")
+
+              parsed = []
+              for d, text in entries:
+                  br = {}
+                  for label, value in RX_BR.findall(text):
+                      br[label.lower()] = parse_float(value)
+                  avg_br = last(RX_AVG_BR, text, float)
+                  parsed.append({
+                      "trial_dir": str(d),
+                      "acc": last(RX_TEST_ACC, text, float),
+                      "auc": last(RX_ROC_AUC, text, float),
+                      "params": last(RX_TOTAL_PARAMS, text, int),
+                      "flops": last(RX_FLOPS, text, int),
+                      "br_w": br.get("w"),
+                      "br_z": br.get("z"),
+                      "br_t": br.get("t"),
+                      "avg_br": avg_br,
+                  })
+
+              avg_from_classes = []
+              for p in parsed:
+                  vals = [p["br_w"], p["br_z"], p["br_t"]]
+                  vals = [v for v in vals if v is not None and math.isfinite(v)]
+                  if len(vals) == 3:
+                      avg_from_classes.append(sum(vals) / 3.0)
+              avg_br_vals = [p["avg_br"] for p in parsed if p["avg_br"] is not None]
+              avg_vals = avg_br_vals or avg_from_classes
+
+              rows = [{
+                  "model": MODEL_DIR,
+                  "Test Accuracy (%)": fmt([p["acc"] for p in parsed], 2, 2, 100.0),
+                  "ROC AUC": fmt([p["auc"] for p in parsed], 4, 4),
+                  "Bg Rej W": fmt([p["br_w"] for p in parsed], 4, 4),
+                  "Bg Rej Z": fmt([p["br_z"] for p in parsed], 4, 4),
+                  "Bg Rej t": fmt([p["br_t"] for p in parsed], 4, 4),
+                  "Avg Bg Rej": fmt(avg_vals, 4, 4),
+                  "# Params": str(next((p["params"] for p in parsed if p["params"] is not None), "")),
+                  "FLOPs": str(next((p["flops"] for p in parsed if p["flops"] is not None), "")),
+              }]
+
+              cols = ["model", "Test Accuracy (%)", "ROC AUC", "Bg Rej W", "Bg Rej Z", "Bg Rej t", "Avg Bg Rej", "# Params", "FLOPs"]
+              print("\n===== HLS4ML Full ParT Benchmark (Markdown) =====\n")
+              print("| " + " | ".join(cols) + " |")
+              print("| " + " | ".join(["---"] * len(cols)) + " |")
+              for row in rows:
+                  print("| " + " | ".join(str(row.get(c, "")) for c in cols) + " |")
+              print("\n===== HLS4ML Full ParT Benchmark TSV =====\n")
+              print("\t".join(cols))
+              for row in rows:
+                  print("\t".join(str(row.get(c, "")) for c in cols))
+              print("\n===== Trials Used =====\n")
+              for p in parsed:
+                  print(p["trial_dir"])
+              PY
+
+              python /tmp/summarize_hls4ml_full_part.py
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol

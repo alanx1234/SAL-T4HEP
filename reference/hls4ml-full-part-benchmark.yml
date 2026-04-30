@@ -1,0 +1,111 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-hls4ml-full-part-benchmark
+  namespace: cms-ml
+spec:
+  completions: 3
+  parallelism: 3
+  completionMode: Indexed
+  backoffLimit: 4
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euxo pipefail
+
+              # indices 0-2: full Particle Transformer architecture trials 0,1,2
+
+              IDX=$JOB_COMPLETION_INDEX
+              TRIAL_IDX=$IDX
+
+              REPO_DIR="/tmp/sal_t_hls4ml_full_part_benchmark"
+              REPO_REF="${REPO_REF:-iclr}"
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout "$REPO_REF"
+                git pull || true
+              else
+                git clone https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout "$REPO_REF"
+              fi
+
+              DATA_DIR="${DATA_DIR:-/j-jepa-vol/l1-jet-id/data/jetid/processed}"
+              SAVE_BASE="${SAVE_BASE:-/j-jepa-vol/1p3mFLOPs_runs}"
+              RUN_TAG="full-part-hls4ml-idx-${IDX}-trial-${TRIAL_IDX}"
+              mkdir -p "$SAVE_BASE"
+
+              test -f "$DATA_DIR/x_train_robust_150const_ptetaphi.npy"
+              test -f "$DATA_DIR/y_train_robust_150const_ptetaphi.npy"
+              test -f "$DATA_DIR/x_val_robust_150const_ptetaphi.npy"
+              test -f "$DATA_DIR/y_val_robust_150const_ptetaphi.npy"
+
+              cd "$REPO_DIR/scripts"
+              python3 -m py_compile train_part.py
+
+              echo "=== HLS4ML: full ParT architecture (index=$IDX) ==="
+              python3 train_part.py \
+                --data_dir       "$DATA_DIR" \
+                --save_dir       "$SAVE_BASE/full_part_hls4ml/$RUN_TAG" \
+                --dataset        hls4ml \
+                --sort_by        kt \
+                --num_particles  150 \
+                --embed_dims     128 512 128 \
+                --pair_embed_dims 64 64 64 \
+                --pair_input_dim 4 \
+                --num_heads      8 \
+                --num_layers     8 \
+                --num_cls_layers 2 \
+                --dropout        0.1 \
+                --schedule       none \
+                --batch_size     256 \
+                --num_epochs     1400 \
+                --early_stopping_patience 50
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"

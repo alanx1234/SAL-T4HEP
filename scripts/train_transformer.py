@@ -231,7 +231,7 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
                 else np.ones_like(y_test[:, 0], dtype=bool)
             )
             if dataset == "jetclass":
-                bin_y = (y_test[mask_bg, i] == i).astype(int)
+                bin_y = (y_test[mask_bg, i] == 1).astype(int)
                 bin_s = preds[mask_bg, i]
             else:
                 bin_y = (y_test[mask_bg, i] == 1).astype(int)

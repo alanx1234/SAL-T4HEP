@@ -45,14 +45,16 @@ spec:
             - |
               set -euxo pipefail
 
-              # indices 0-2:    JEDI-Linear trials 13,14,15
-              # indices 3-5:    Transformer trials 12,13,14
-              # indices 6-8:    PTv3 config1 trials 9,10,11
-              # indices 9-11:   PTv3 config2 trials 5,6,7
-              # indices 12-14:  PTv3 config3 trials 7,8,9
-              # indices 15-17:  SAL-T 1.3M-FLOPs trials 0,1,2
-              # indices 18-20:  ParT 1.3M-FLOPs trials 0,1,2
-              # indices 21-23:  Linformer 1.3M-FLOPs trials 0,1,2
+              # Within each model group, TRIAL_IDX 0,1,2 selects the latest three
+              # available checkpoint trials by numeric trial id.
+              # indices 0-2:    JEDI-Linear
+              # indices 3-5:    Transformer
+              # indices 6-8:    PTv3 config1
+              # indices 9-11:   PTv3 config2
+              # indices 12-14:  PTv3 config3
+              # indices 15-17:  SAL-T 1.3M-FLOPs
+              # indices 18-20:  ParT 1.3M-FLOPs
+              # indices 21-23:  Linformer 1.3M-FLOPs
 
               IDX=$JOB_COMPLETION_INDEX
               MODEL_IDX=$((IDX / 3))
@@ -87,10 +89,38 @@ spec:
                 train_linformer.py \
                 train_part.py
 
-              if [ "$MODEL_IDX" -eq 0 ]; then
-                TRAIN_TRIAL=$((13 + TRIAL_IDX))
-                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/jedi_linear/150/kt/custom/trial-${TRAIN_TRIAL}/model.weights.h5"
+              select_checkpoint() {
+                local root="$1"
+                local filename="$2"
+                local rank="$3"
+                local selected
+
+                if [ ! -d "$root" ]; then
+                  echo "Missing checkpoint root: $root" >&2
+                  exit 1
+                fi
+
+                selected="$(
+                  find "$root" -mindepth 2 -maxdepth 2 -type f -name "$filename" \
+                    | awk -F/ '{trial=$(NF-1); if (trial ~ /^trial-[0-9]+$/) {sub(/^trial-/, "", trial); print trial "|" $0}}' \
+                    | sort -k1,1nr \
+                    | awk -v rank="$rank" 'NR == rank + 1 {print; exit}'
+                )"
+
+                if [ -z "$selected" ]; then
+                  echo "Could not find checkpoint rank $rank named $filename under $root" >&2
+                  find "$root" -mindepth 2 -maxdepth 2 -type f -name "$filename" | sort >&2 || true
+                  exit 1
+                fi
+
+                TRAIN_TRIAL="${selected%%|*}"
+                CHECKPOINT="${selected#*|}"
                 test -f "$CHECKPOINT"
+                echo "Selected checkpoint trial-${TRAIN_TRIAL}: $CHECKPOINT"
+              }
+
+              if [ "$MODEL_IDX" -eq 0 ]; then
+                select_checkpoint "/j-jepa-vol/1p3m_FLOPs_runs/jedi_linear/150/kt/custom" "model.weights.h5" "$TRIAL_IDX"
                 echo "=== JetClass 20M retest: JEDI-Linear checkpoint trial-${TRAIN_TRIAL} ==="
                 python3 train_jedi_linear.py \
                   --data_dir        "$DATA_DIR" \
@@ -108,9 +138,7 @@ spec:
                   --checkpoint_path "$CHECKPOINT"
 
               elif [ "$MODEL_IDX" -eq 1 ]; then
-                TRAIN_TRIAL=$((12 + TRIAL_IDX))
-                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/transformer/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
-                test -f "$CHECKPOINT"
+                select_checkpoint "/j-jepa-vol/1p3m_FLOPs_runs/transformer/150/kt" "model.weights.h5" "$TRIAL_IDX"
                 echo "=== JetClass 20M retest: Transformer checkpoint trial-${TRAIN_TRIAL} ==="
                 python3 train_transformer.py \
                   --data_dir        "$DATA_DIR" \
@@ -126,9 +154,7 @@ spec:
                   --checkpoint_path "$CHECKPOINT"
 
               elif [ "$MODEL_IDX" -eq 2 ]; then
-                TRAIN_TRIAL=$((9 + TRIAL_IDX))
-                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/ptv3_config1/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
-                test -f "$CHECKPOINT"
+                select_checkpoint "/j-jepa-vol/1p3m_FLOPs_runs/ptv3_config1/150/kt" "model.weights.h5" "$TRIAL_IDX"
                 echo "=== JetClass 20M retest: PTv3 config1 checkpoint trial-${TRAIN_TRIAL} ==="
                 python3 train_point_transformer.py \
                   --data_dir             "$DATA_DIR" \
@@ -148,9 +174,7 @@ spec:
                   --checkpoint_path      "$CHECKPOINT"
 
               elif [ "$MODEL_IDX" -eq 3 ]; then
-                TRAIN_TRIAL=$((5 + TRIAL_IDX))
-                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/ptv3_config2/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
-                test -f "$CHECKPOINT"
+                select_checkpoint "/j-jepa-vol/1p3m_FLOPs_runs/ptv3_config2/150/kt" "model.weights.h5" "$TRIAL_IDX"
                 echo "=== JetClass 20M retest: PTv3 config2 checkpoint trial-${TRAIN_TRIAL} ==="
                 python3 train_point_transformer.py \
                   --data_dir             "$DATA_DIR" \
@@ -169,9 +193,7 @@ spec:
                   --checkpoint_path      "$CHECKPOINT"
 
               elif [ "$MODEL_IDX" -eq 4 ]; then
-                TRAIN_TRIAL=$((7 + TRIAL_IDX))
-                CHECKPOINT="/j-jepa-vol/1p3m_FLOPs_runs/ptv3_config3/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
-                test -f "$CHECKPOINT"
+                select_checkpoint "/j-jepa-vol/1p3m_FLOPs_runs/ptv3_config3/150/kt" "model.weights.h5" "$TRIAL_IDX"
                 echo "=== JetClass 20M retest: PTv3 config3 checkpoint trial-${TRAIN_TRIAL} ==="
                 python3 train_point_transformer.py \
                   --data_dir             "$DATA_DIR" \
@@ -190,9 +212,7 @@ spec:
                   --checkpoint_path      "$CHECKPOINT"
 
               elif [ "$MODEL_IDX" -eq 5 ]; then
-                TRAIN_TRIAL=$TRIAL_IDX
-                CHECKPOINT="/j-jepa-vol/1p3mFLOPs_runs/salt_jetclass/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
-                test -f "$CHECKPOINT"
+                select_checkpoint "/j-jepa-vol/1p3mFLOPs_runs/salt_jetclass/150/kt" "model.weights.h5" "$TRIAL_IDX"
                 echo "=== JetClass 20M retest: SAL-T checkpoint trial-${TRAIN_TRIAL} ==="
                 python3 train_linformer.py \
                   --data_dir            "$DATA_DIR" \
@@ -219,9 +239,7 @@ spec:
                   --checkpoint_path     "$CHECKPOINT"
 
               elif [ "$MODEL_IDX" -eq 6 ]; then
-                TRAIN_TRIAL=$TRIAL_IDX
-                CHECKPOINT="/j-jepa-vol/1p3mFLOPs_runs/part_d10_h2_pe4_jetclass/150/kt/trial-${TRAIN_TRIAL}/best_model.pt"
-                test -f "$CHECKPOINT"
+                select_checkpoint "/j-jepa-vol/1p3mFLOPs_runs/part_d10_h2_pe4_jetclass/150/kt" "best_model.pt" "$TRIAL_IDX"
                 echo "=== JetClass 20M retest: ParT checkpoint trial-${TRAIN_TRIAL} ==="
                 python3 train_part.py \
                   --data_dir        "$DATA_DIR" \
@@ -240,9 +258,7 @@ spec:
                   --checkpoint_path "$CHECKPOINT"
 
               elif [ "$MODEL_IDX" -eq 7 ]; then
-                TRAIN_TRIAL=$TRIAL_IDX
-                CHECKPOINT="/j-jepa-vol/1p3mFLOPs_runs/linformer_jetclass/150/kt/trial-${TRAIN_TRIAL}/model.weights.h5"
-                test -f "$CHECKPOINT"
+                select_checkpoint "/j-jepa-vol/1p3mFLOPs_runs/linformer_jetclass/150/kt" "model.weights.h5" "$TRIAL_IDX"
                 echo "=== JetClass 20M retest: Linformer checkpoint trial-${TRAIN_TRIAL} ==="
                 python3 train_linformer.py \
                   --data_dir            "$DATA_DIR" \
