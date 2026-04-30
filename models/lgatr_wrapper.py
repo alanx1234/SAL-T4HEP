@@ -2,6 +2,31 @@ import torch
 from torch import nn
 
 
+def _patch_lgatr_cached_einsum():
+    """Use torch.einsum instead of lgatr's opt_einsum path cache.
+
+    Some cluster environments fail while opt_einsum builds a cached contraction
+    path for L-GATr's normalization einsums. The plain torch implementation is
+    slower but avoids that external path-planning failure.
+    """
+
+    def safe_cached_einsum(equation, *operands):
+        return torch.einsum(equation, *operands)
+
+    try:
+        import lgatr.primitives.bilinear as bilinear
+        import lgatr.primitives.invariants as invariants
+        import lgatr.primitives.linear as linear
+        import lgatr.utils.einsum as einsum_utils
+    except ImportError:
+        return
+
+    einsum_utils.cached_einsum = safe_cached_einsum
+    bilinear.cached_einsum = safe_cached_einsum
+    invariants.cached_einsum = safe_cached_einsum
+    linear.cached_einsum = safe_cached_einsum
+
+
 class LGATrJetClassifier(nn.Module):
     """Jet classifier wrapper around the maintained ``lgatr`` package.
 
@@ -32,6 +57,7 @@ class LGATrJetClassifier(nn.Module):
                 "LGATrJetClassifier requires the external 'lgatr' package. "
                 "Install it with: python -m pip install lgatr"
             ) from exc
+        _patch_lgatr_cached_einsum()
 
         self.embed_vector = embed_vector
         self.extract_scalar = extract_scalar
