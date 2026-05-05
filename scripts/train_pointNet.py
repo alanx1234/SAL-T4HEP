@@ -23,6 +23,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from models.pointNet import build_pointnet_classifier
+from scripts.keras_chunked_testing import predict_in_chunks
 
 
 def parse_training_schedule(schedule, batch_size, num_epochs):
@@ -112,49 +113,59 @@ def apply_sorting(x, sort_by):
 # ---------------------------
 # Testing / Profiling
 # ---------------------------
-def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles):
+def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, test_batch_size=None):
     logging.info("Starting testing phase...")
+    test_batch_size = test_batch_size or batch_size
+    logging.info("Using test batch size: %d", test_batch_size)
 
     # load test set
     if dataset == "hls4ml":
         x_test = np.load(
-            os.path.join(data_dir, f"x_val_robust_{num_particles}const_ptetaphi.npy")
+            os.path.join(data_dir, f"x_val_robust_{num_particles}const_ptetaphi.npy"),
+            mmap_mode="r",
         )
         y_test = np.load(
-            os.path.join(data_dir, f"y_val_robust_{num_particles}const_ptetaphi.npy")
+            os.path.join(data_dir, f"y_val_robust_{num_particles}const_ptetaphi.npy"),
+            mmap_mode="r",
         )
     else:  # jetclass, top, or QG
-        x_test = np.load(os.path.join(data_dir, "test/features.npy"))
-        y_test = np.load(os.path.join(data_dir, "test/labels.npy"))
+        x_test = np.load(os.path.join(data_dir, "test/features.npy"), mmap_mode="r")
+        y_test = np.load(os.path.join(data_dir, "test/labels.npy"), mmap_mode="r")
     logging.info(
         "Loaded TEST arrays for %s: %s, %s", dataset, x_test.shape, y_test.shape
     )
 
-    if dataset == "jetclass":
-        x_test = x_test.transpose(0, 2, 1)
+    n_test = x_test.shape[0]
 
-    x_test = apply_sorting(x_test, sort_by)
+    def prepare_test_chunk(start, end):
+        x_chunk = np.asarray(x_test[start:end])
+        if dataset == "jetclass":
+            x_chunk = x_chunk.transpose(0, 2, 1)
+        x_chunk = apply_sorting(x_chunk, sort_by)
+        return x_chunk.astype(np.float32, copy=False)
+
+    x_sample = prepare_test_chunk(0, min(test_batch_size, n_test))
     logging.info("Applied '%s' sorting to TEST set", sort_by)
 
-    num_p, feat_d = x_test.shape[1], x_test.shape[2]
+    num_p, feat_d = x_sample.shape[1], x_sample.shape[2]
     flops = get_flops(model, (1, num_p, feat_d))
     macs = flops // 2
     logging.info("FLOPs per inference: %d", flops)
     logging.info("MACs per inference: %d", macs)
 
-    _ = model.predict(x_test[:batch_size], batch_size=batch_size)
+    _ = model.predict(x_sample, batch_size=test_batch_size)
     times = []
     for _ in range(20):
         t0 = time.perf_counter()
-        _ = model.predict(x_test[:batch_size], batch_size=batch_size)
+        _ = model.predict(x_sample, batch_size=test_batch_size)
         times.append(time.perf_counter() - t0)
-    avg_ns = np.mean(times) / batch_size * 1e9
+    avg_ns = np.mean(times) / x_sample.shape[0] * 1e9
     logging.info("Avg inference time/event: %.2f ns", avg_ns)
 
-    curr, peak = profile_gpu_memory_during_inference(model, x_test[:batch_size])
+    curr, peak = profile_gpu_memory_during_inference(model, x_sample)
     logging.info("GPU memory current: %.1f MB, peak: %.1f MB", curr, peak)
 
-    preds = model.predict(x_test, batch_size=batch_size)
+    preds = predict_in_chunks(model, n_test, test_batch_size, prepare_test_chunk)
     if dataset == "top" or dataset == "QG":
         acc = accuracy_score(y_test, (preds.ravel() > 0.5).astype(int))
         auc_m = roc_auc_score(y_test, preds.ravel())
@@ -169,6 +180,11 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
         labels = ["qcd", "top"]
     elif dataset == "QG":
         labels = ["Gluon", "Quark"]
+    elif dataset == "jetclass":
+        labels = [
+            "label_QCD", "label_Hbb", "label_Hcc", "label_Hgg", "label_H4q",
+            "label_Hqql", "label_Zqq", "label_Wqq", "label_Tbqq", "label_Tbl",
+        ]
     else:
         labels = [f"label_{i}" for i in range(preds.shape[1])]
 
@@ -216,6 +232,7 @@ def parse_args():
         default="kt",
     )
     p.add_argument("--batch_size", type=int, default=4096)
+    p.add_argument("--test_batch_size", type=int, default=None)
     p.add_argument("--num_epochs", type=int, default=500)
     p.add_argument(
         "--schedule",
@@ -397,7 +414,7 @@ def main():
 
     run_testing(
         model, args.dataset, args.data_dir,
-        save_dir, args.sort_by, args.batch_size, num_particles,
+        save_dir, args.sort_by, args.batch_size, num_particles, args.test_batch_size,
     )
 
 

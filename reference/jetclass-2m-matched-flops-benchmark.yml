@@ -95,6 +95,7 @@ spec:
                   --base_width  21 \
                   --schedule    none \
                   --batch_size  4096 \
+                  --test_batch_size 512 \
                   --num_epochs  500 \
                   --early_stopping_patience 50
 
@@ -117,6 +118,7 @@ spec:
                   --serialize_by    kt \
                   --schedule        none \
                   --batch_size      4096 \
+                  --test_batch_size 512 \
                   --num_epochs      500 \
                   --early_stopping_patience 50
               fi

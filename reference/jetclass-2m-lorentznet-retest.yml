@@ -1,0 +1,153 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-jetclass-2m-lorentznet-retest
+  namespace: cms-ml
+spec:
+  completions: 3
+  parallelism: 3
+  completionMode: Indexed
+  backoffLimit: 4
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      containers:
+        - name: retest
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euxo pipefail
+
+              IDX=$JOB_COMPLETION_INDEX
+
+              REPO_DIR="/tmp/sal_t_jetclass_2m_lorentznet_retest"
+              REPO_REF="${REPO_REF:-iclr}"
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout "$REPO_REF"
+                git pull || true
+              else
+                git clone https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout "$REPO_REF"
+              fi
+
+              DATA_DIR="${DATA_DIR:-/j-jepa-vol/linformer_data/JetClass/kinematics_2m}"
+              SOURCE_ROOT="${SOURCE_ROOT:-/j-jepa-vol/jetclass_2m_benchmark_runs/lorentznet}"
+              RETEST_BASE="${RETEST_BASE:-/j-jepa-vol/jetclass_2m_lorentznet_retest_runs}"
+              RUN_TAG="retest-idx-${IDX}"
+              export IDX SOURCE_ROOT
+              mkdir -p "$RETEST_BASE/$RUN_TAG"
+
+              test -f "$DATA_DIR/test/features.npy"
+              test -f "$DATA_DIR/test/vectors.npy"
+              test -f "$DATA_DIR/test/labels.npy"
+
+              CKPT="$(python3 - <<'PY'
+              from __future__ import annotations
+              import os
+              import re
+              import sys
+              from pathlib import Path
+
+              idx = int(os.environ["IDX"])
+              source_root = Path(os.environ["SOURCE_ROOT"])
+              rx_test_acc = re.compile(r"Test\s*Accuracy:", re.I)
+
+              candidates = []
+              for ckpt in source_root.rglob("best_model.pt"):
+                  if not ckpt.is_file() or ckpt.stat().st_size <= 0:
+                      continue
+                  trial_dir = ckpt.parent
+                  log_path = trial_dir / "train.log"
+                  if not log_path.is_file():
+                      continue
+                  text = log_path.read_text(errors="ignore")
+                  if rx_test_acc.search(text):
+                      continue
+                  final_model = trial_dir / "final_model.pt"
+                  reached_end = "Early stopping at epoch" in text or (
+                      final_model.is_file() and final_model.stat().st_size > 0
+                  )
+                  if not reached_end:
+                      continue
+                  candidates.append(ckpt)
+
+              candidates.sort(key=lambda p: str(p))
+              print(f"Found {len(candidates)} LorentzNet checkpoints needing retest", file=sys.stderr)
+              for i, path in enumerate(candidates):
+                  print(f"[{i}] {path}", file=sys.stderr)
+              if idx >= len(candidates):
+                  sys.exit(0)
+              print(candidates[idx])
+              PY
+              )"
+
+              if [ -z "$CKPT" ]; then
+                echo "No LorentzNet checkpoint assigned to index $IDX; exiting."
+                exit 0
+              fi
+
+              printf '%s\n' "$CKPT" > "$RETEST_BASE/$RUN_TAG/source_checkpoint.txt"
+
+              cd "$REPO_DIR/scripts"
+              python3 -m py_compile train_lorentznet.py
+
+              echo "=== JetClass 2M: LorentzNet checkpoint retest (index=$IDX) ==="
+              echo "Checkpoint: $CKPT"
+              python3 train_lorentznet.py \
+                --data_dir        "$DATA_DIR" \
+                --save_dir        "$RETEST_BASE/$RUN_TAG" \
+                --dataset         jetclass \
+                --sort_by         kt \
+                --num_particles   150 \
+                --flops_batch_size 1 \
+                --schedule        none \
+                --batch_size      32 \
+                --num_epochs      500 \
+                --early_stopping_patience 50 \
+                --test_only \
+                --checkpoint_path "$CKPT"
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"

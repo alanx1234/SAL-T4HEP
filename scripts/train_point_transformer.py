@@ -178,6 +178,7 @@ def choose_divisible_patch_sizes(stage_lengths, preferred=[64, 32, 16, 8, 4, 2, 
 # ---------------------------
 def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size, num_particles_truncate=None, enc_patch_sizes=None):
 		logging.info("Starting testing phase...")
+		logging.info("Using test batch size: %d", batch_size)
 
 		# load test set
 		if dataset == "hls4ml":
@@ -350,6 +351,7 @@ def parse_args():
 		    help="One or more test-time orderings to evaluate. Defaults to --sort_by."
 		)
 		p.add_argument("--batch_size", type=int, default=4096)
+		p.add_argument("--test_batch_size", type=int, default=None)
 		p.add_argument("--num_epochs", type=int, default=500)
 		p.add_argument(
 				"--schedule",
@@ -634,7 +636,7 @@ def main():
 				        args.data_dir,
 				        save_dir,
 				        test_sort,
-				        args.batch_size,
+				        args.test_batch_size or args.batch_size,
 				        num_particles_for_files,
 				        morton_grid_size=args.morton_grid_size,
 				        num_particles_truncate=args.num_particles_truncate,
@@ -717,7 +719,7 @@ def main():
 		        args.data_dir,
 		        save_dir,
 		        test_sort,
-		        args.batch_size,
+		        args.test_batch_size or args.batch_size,
 		        num_particles_for_files,
 		        morton_grid_size=args.morton_grid_size,
 		        num_particles_truncate=args.num_particles_truncate,
