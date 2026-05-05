@@ -123,6 +123,86 @@ def load_test_data(dataset, data_dir, num_particles):
     return x, y, p4.astype(np.float32)
 
 
+def _load_test_arrays(data_dir, dataset, num_particles, mmap_mode=None):
+    if dataset == "hls4ml":
+        x = np.load(
+            os.path.join(data_dir, f"x_val_robust_{num_particles}const_ptetaphi.npy"),
+            mmap_mode=mmap_mode,
+        )
+        y = np.load(
+            os.path.join(data_dir, f"y_val_robust_{num_particles}const_ptetaphi.npy"),
+            mmap_mode=mmap_mode,
+        )
+        p4 = None
+    else:
+        x = np.load(os.path.join(data_dir, "test/features.npy"), mmap_mode=mmap_mode)
+        y = np.load(os.path.join(data_dir, "test/labels.npy"), mmap_mode=mmap_mode)
+        vectors_path = os.path.join(data_dir, "test", "vectors.npy")
+        p4 = np.load(vectors_path, mmap_mode=mmap_mode) if os.path.exists(vectors_path) else None
+    return x, y, p4
+
+
+def _prepare_test_chunk(x_arr, y_arr, p4_arr, dataset, start, end, sort_by, num_particles_truncate):
+    x = np.asarray(x_arr[start:end])
+    y = np.asarray(y_arr[start:end])
+    p4 = np.asarray(p4_arr[start:end]) if p4_arr is not None else None
+    if dataset == "jetclass":
+        x, p4 = _maybe_transpose_jetclass(x, p4)
+    if p4 is None:
+        p4 = ptetaphi_to_p4(x)
+    x, p4 = apply_sorting(x, sort_by, p4)
+    x, p4 = truncate_arrays(x, p4, num_particles_truncate)
+    return x, y, p4.astype(np.float32)
+
+
+def evaluate_test_data_in_chunks(
+    model,
+    dataset,
+    data_dir,
+    num_particles,
+    sort_by,
+    num_particles_truncate,
+    batch_size,
+    test_chunk_size,
+    device,
+    forward_fn,
+    num_classes,
+):
+    x_arr, y_arr, p4_arr = _load_test_arrays(data_dir, dataset, num_particles, mmap_mode="r")
+    n_events = len(y_arr)
+    chunk_size = max(int(test_chunk_size or n_events), batch_size)
+    logging.info("Running chunked TEST evaluation with chunk_size=%d", chunk_size)
+
+    first_batch = None
+    probs, labels = [], []
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, n_events, chunk_size):
+            end = min(start + chunk_size, n_events)
+            logging.info("TEST chunk %d:%d / %d", start, end, n_events)
+            x_chunk, y_chunk, p4_chunk = _prepare_test_chunk(
+                x_arr, y_arr, p4_arr, dataset, start, end, sort_by, num_particles_truncate
+            )
+            loader = make_loader(x_chunk, p4_chunk, y_chunk, batch_size, shuffle=False)
+            for batch in loader:
+                if first_batch is None:
+                    first_batch = tuple(t.clone() for t in batch)
+                batch = tuple(t.to(device) for t in batch)
+                logits = forward_fn(model, batch)
+                probs.append(torch.softmax(logits, dim=1).cpu().numpy())
+                labels.append(batch[-1].cpu().numpy())
+
+    probs = np.concatenate(probs)
+    labels = np.concatenate(labels)
+    y_onehot = one_hot_from_indices(labels, num_classes)
+    acc = accuracy_score(labels, probs.argmax(axis=1))
+    if num_classes == 2:
+        auc_m = roc_auc_score(labels, probs[:, 1])
+    else:
+        auc_m = roc_auc_score(y_onehot, probs, average="macro", multi_class="ovo")
+    return first_batch, labels, y_onehot, probs, acc, auc_m
+
+
 def truncate_arrays(x, p4, num_particles_truncate):
     if num_particles_truncate is None:
         return x, p4

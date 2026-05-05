@@ -131,7 +131,8 @@ spec:
                 --num_particles   150 \
                 --flops_batch_size 1 \
                 --schedule        none \
-                --batch_size      32 \
+                --batch_size      16 \
+                --test_chunk_size 50000 \
                 --num_epochs      500 \
                 --early_stopping_patience 50 \
                 --test_only \

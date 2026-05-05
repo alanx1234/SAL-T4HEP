@@ -20,10 +20,9 @@ if PROJECT_ROOT not in sys.path:
 from models.lorentznet import LorentzNet
 from scripts.equivariant_utils import (
     apply_sorting,
-    evaluate,
+    evaluate_test_data_in_chunks,
     get_flops_profiler,
     load_data,
-    load_test_data,
     lorentz_scalars_from_p4,
     make_full_edges,
     make_loader,
@@ -66,6 +65,7 @@ def parse_args():
     p.add_argument("--log_every_batches", type=int, default=500, help="Log training progress every N batches; 0 disables")
     p.add_argument("--test_only", action="store_true", help="Skip training and evaluate a checkpoint")
     p.add_argument("--checkpoint_path", default=None, help="Checkpoint path to load with --test_only")
+    p.add_argument("--test_chunk_size", type=int, default=100000, help="Number of test events to load/evaluate at a time")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -168,14 +168,21 @@ def main():
     if args.test_only:
         logging.info("Loading checkpoint: %s", args.checkpoint_path)
         model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
-        x_test, y_test, p4_test = load_test_data(args.dataset, args.data_dir, num_particles)
-        x_test, p4_test = apply_sorting(x_test, args.sort_by, p4_test)
-        x_test, p4_test = truncate_arrays(x_test, p4_test, args.num_particles_truncate)
-        test_loader = make_loader(x_test, p4_test, y_test, args.batch_size, shuffle=False)
-        first_test_batch = next(iter(test_loader))
+        first_test_batch, labels, y_onehot, probs, acc, auc_m = evaluate_test_data_in_chunks(
+            model,
+            args.dataset,
+            args.data_dir,
+            num_particles,
+            args.sort_by,
+            args.num_particles_truncate,
+            args.batch_size,
+            args.test_chunk_size,
+            device,
+            forward_lorentznet,
+            num_classes,
+        )
         avg_ns = time_inference(model, first_test_batch, len(first_test_batch[-1]), device, forward_lorentznet)
         logging.info("Avg inference time/event: %.2f ns", avg_ns)
-        labels, y_onehot, probs, acc, auc_m = evaluate(model, test_loader, device, forward_lorentznet, num_classes)
         logging.info("Test Accuracy: %.4f, ROC AUC: %.4f", acc, auc_m)
         plot_and_log_metrics(labels, y_onehot, probs, args.dataset, save_dir)
         return
@@ -244,13 +251,21 @@ def main():
         model.load_state_dict(torch.load(best_path, map_location=device))
     save_curves(save_dir, histories)
 
-    x_test, y_test, p4_test = load_test_data(args.dataset, args.data_dir, num_particles)
-    x_test, p4_test = apply_sorting(x_test, args.sort_by, p4_test)
-    x_test, p4_test = truncate_arrays(x_test, p4_test, args.num_particles_truncate)
-    test_loader = make_loader(x_test, p4_test, y_test, args.batch_size, shuffle=False)
+    first_test_batch, labels, y_onehot, probs, acc, auc_m = evaluate_test_data_in_chunks(
+        model,
+        args.dataset,
+        args.data_dir,
+        num_particles,
+        args.sort_by,
+        args.num_particles_truncate,
+        args.batch_size,
+        args.test_chunk_size,
+        device,
+        forward_lorentznet,
+        num_classes,
+    )
     avg_ns = time_inference(model, first_batch, len(first_batch[-1]), device, forward_lorentznet)
     logging.info("Avg inference time/event: %.2f ns", avg_ns)
-    labels, y_onehot, probs, acc, auc_m = evaluate(model, test_loader, device, forward_lorentznet, num_classes)
     logging.info("Test Accuracy: %.4f, ROC AUC: %.4f", acc, auc_m)
     plot_and_log_metrics(labels, y_onehot, probs, args.dataset, save_dir)
 
