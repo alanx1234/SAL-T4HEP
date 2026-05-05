@@ -25,6 +25,24 @@ if PROJECT_ROOT not in sys.path:
 from models.pointNet import build_pointnet_classifier
 
 
+def parse_training_schedule(schedule, batch_size, num_epochs):
+    if schedule is None or str(schedule).strip().lower() in ("", "none", "off", "false"):
+        return [(batch_size, num_epochs)]
+
+    parsed = []
+    for item in str(schedule).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        bs, sep, epochs = item.partition(":")
+        if not sep:
+            raise ValueError(f"Invalid schedule item '{item}', expected batch_size:epochs")
+        parsed.append((int(bs), int(epochs)))
+    if not parsed:
+        raise ValueError("Training schedule is empty")
+    return parsed
+
+
 # ---------------------------
 # FLOPs computation
 # ---------------------------
@@ -198,6 +216,13 @@ def parse_args():
         default="kt",
     )
     p.add_argument("--batch_size", type=int, default=4096)
+    p.add_argument("--num_epochs", type=int, default=500)
+    p.add_argument(
+        "--schedule",
+        default="128:200,256:200,512:200,1024:200,2048:200,4096:400",
+        help="Comma-separated training schedule as batch_size:epochs. Use 'none' for --batch_size/--num_epochs.",
+    )
+    p.add_argument("--early_stopping_patience", type=int, default=40)
     p.add_argument("--val_split", type=float, default=0.2)
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument(
@@ -319,17 +344,14 @@ def main():
         verbose=1,
     )
     early = EarlyStopping(
-        monitor="val_loss", patience=40, restore_best_weights=True, verbose=1
+        monitor="val_loss",
+        patience=args.early_stopping_patience,
+        restore_best_weights=True,
+        verbose=1,
     )
 
-    schedule = [
-        (128, 200),
-        (256, 200),
-        (512, 200),
-        (1024, 200),
-        (2048, 200),
-        (4096, 400),
-    ]
+    schedule = parse_training_schedule(args.schedule, args.batch_size, args.num_epochs)
+    logging.info("Training schedule: %s", schedule)
 
     ce = 0
     histories = []

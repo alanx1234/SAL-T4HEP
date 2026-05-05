@@ -1,11 +1,11 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: alan-jetclass-2m2-benchmark
+  name: alan-jetclass-2m-matched-flops-benchmark
   namespace: cms-ml
 spec:
-  completions: 3
-  parallelism: 3
+  completions: 6
+  parallelism: 6
   completionMode: Indexed
   backoffLimit: 4
   template:
@@ -45,12 +45,14 @@ spec:
             - |
               set -euxo pipefail
 
-              # indices 0-2:  LorentzNet unconstrained trials 0,1,2
+              # indices 0-2: PointNet matched-FLOPs trials 0,1,2
+              # indices 3-5: Serialized PTv3 matched-FLOPs trials 0,1,2
 
               IDX=$JOB_COMPLETION_INDEX
-              TRIAL_IDX=$IDX
+              MODEL_IDX=$((IDX / 3))
+              TRIAL_IDX=$((IDX % 3))
 
-              REPO_DIR="/tmp/sal_t_jetclass_2m_equivariant_benchmark"
+              REPO_DIR="/tmp/sal_t_jetclass_2m_matched_flops_benchmark"
               REPO_REF="${REPO_REF:-iclr}"
               if [ -d "$REPO_DIR/.git" ]; then
                 cd "$REPO_DIR"
@@ -64,8 +66,8 @@ spec:
               fi
 
               DATA_DIR="${DATA_DIR:-/j-jepa-vol/linformer_data/JetClass/kinematics_2m}"
-              SAVE_BASE="${SAVE_BASE:-/j-jepa-vol/jetclass_2m_benchmark_runs}"
-              RUN_TAG="equivariant-idx-${IDX}-trial-${TRIAL_IDX}"
+              SAVE_BASE="${SAVE_BASE:-/j-jepa-vol/jetclass_2m_matched_flops_runs}"
+              RUN_TAG="idx-${IDX}-trial-${TRIAL_IDX}"
               mkdir -p "$SAVE_BASE"
 
               test -f "$DATA_DIR/train/features.npy"
@@ -79,20 +81,45 @@ spec:
               test -f "$DATA_DIR/test/labels.npy"
 
               cd "$REPO_DIR/scripts"
-              python3 -m py_compile train_lorentznet.py
+              python3 -m py_compile \
+                train_pointNet.py \
+                train_point_transformer.py
 
-              echo "=== JetClass 2M: LorentzNet unconstrained (index=$IDX) ==="
-              python3 train_lorentznet.py \
-                --data_dir      "$DATA_DIR" \
-                --save_dir      "$SAVE_BASE/lorentznet/$RUN_TAG" \
-                --dataset       jetclass \
-                --sort_by       kt \
-                --num_particles 150 \
-                --flops_batch_size 1 \
-                --schedule      none \
-                --batch_size    32 \
-                --num_epochs    500 \
-                --early_stopping_patience 50
+              if [ "$MODEL_IDX" -eq 0 ]; then
+                echo "=== JetClass 2M matched-FLOPs: PointNet (index=$IDX) ==="
+                python3 train_pointNet.py \
+                  --data_dir    "$DATA_DIR" \
+                  --save_dir    "$SAVE_BASE/pointnet/$RUN_TAG" \
+                  --dataset     jetclass \
+                  --sort_by     kt \
+                  --base_width  21 \
+                  --schedule    none \
+                  --batch_size  4096 \
+                  --num_epochs  500 \
+                  --early_stopping_patience 50
+
+              elif [ "$MODEL_IDX" -eq 1 ]; then
+                echo "=== JetClass 2M matched-FLOPs: Serialized PTv3 (index=$IDX) ==="
+                python3 train_point_transformer.py \
+                  --data_dir        "$DATA_DIR" \
+                  --save_dir        "$SAVE_BASE/ptv3_serialized/$RUN_TAG" \
+                  --dataset         jetclass \
+                  --sort_by         kt \
+                  --model_size      small \
+                  --enc_dims        16 32 \
+                  --enc_layers      1 1 \
+                  --enc_heads       4 4 \
+                  --enc_patch_sizes 25 25 \
+                  --enc_strides     2 \
+                  --grid_size       0.2 \
+                  --aggregation     max \
+                  --use_serialized_model \
+                  --serialize_by    kt \
+                  --schedule        none \
+                  --batch_size      4096 \
+                  --num_epochs      500 \
+                  --early_stopping_patience 50
+              fi
 
           volumeMounts:
             - name: work

@@ -1,0 +1,184 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-jetclass-1m-transformer-benchmark
+  namespace: cms-ml
+spec:
+  completions: 3
+  parallelism: 3
+  completionMode: Indexed
+  backoffLimit: 4
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euxo pipefail
+
+              # indices 0-2: Transformer matched-FLOPs config trials 0,1,2
+
+              IDX=$JOB_COMPLETION_INDEX
+              TRIAL_IDX=$IDX
+
+              REPO_DIR="/tmp/sal_t_jetclass_1m_transformer_benchmark"
+              REPO_REF="${REPO_REF:-iclr}"
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout "$REPO_REF"
+                git pull || true
+              else
+                git clone https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout "$REPO_REF"
+              fi
+
+              SOURCE_DATA_DIR="${SOURCE_DATA_DIR:-/j-jepa-vol/linformer_data/JetClass/kinematics_2m}"
+              DATA_DIR="${DATA_DIR:-/tmp/jetclass_1m_transformer_balanced_${IDX}}"
+              TRAIN_EVENTS="${TRAIN_EVENTS:-1000000}"
+              SAVE_BASE="${SAVE_BASE:-/j-jepa-vol/jetclass_1m_benchmark_runs}"
+              RUN_TAG="transformer-idx-${IDX}-trial-${TRIAL_IDX}"
+              export SOURCE_DATA_DIR DATA_DIR TRAIN_EVENTS
+              mkdir -p "$SAVE_BASE"
+
+              test -f "$SOURCE_DATA_DIR/train/features.npy"
+              test -f "$SOURCE_DATA_DIR/train/vectors.npy"
+              test -f "$SOURCE_DATA_DIR/train/labels.npy"
+              test -f "$SOURCE_DATA_DIR/val/features.npy"
+              test -f "$SOURCE_DATA_DIR/val/vectors.npy"
+              test -f "$SOURCE_DATA_DIR/val/labels.npy"
+              test -f "$SOURCE_DATA_DIR/test/features.npy"
+              test -f "$SOURCE_DATA_DIR/test/vectors.npy"
+              test -f "$SOURCE_DATA_DIR/test/labels.npy"
+
+              python3 - <<'PY'
+              import os
+              import shutil
+              from pathlib import Path
+
+              import numpy as np
+
+              source = Path(os.environ["SOURCE_DATA_DIR"])
+              target = Path(os.environ["DATA_DIR"])
+              train_events = int(os.environ.get("TRAIN_EVENTS", "1000000"))
+              seed = int(os.environ.get("SUBSET_SEED", "12345"))
+
+              rng = np.random.default_rng(seed)
+              labels = np.load(source / "train" / "labels.npy", mmap_mode="r")
+              class_ids = labels.argmax(axis=1) if labels.ndim == 2 else labels.astype(np.int64)
+              classes = np.arange(labels.shape[1] if labels.ndim == 2 else int(class_ids.max()) + 1)
+              per_class = train_events // len(classes)
+              remainder = train_events % len(classes)
+
+              chosen = []
+              counts = {}
+              for i, cls in enumerate(classes):
+                  available = np.flatnonzero(class_ids == cls)
+                  need = per_class + (1 if i < remainder else 0)
+                  if len(available) < need:
+                      raise SystemExit(
+                          f"Class {cls} has only {len(available)} training events, need {need}"
+                      )
+                  cls_choice = rng.choice(available, size=need, replace=False)
+                  chosen.append(cls_choice)
+                  counts[int(cls)] = int(need)
+
+              selected = np.concatenate(chosen)
+              rng.shuffle(selected)
+              read_order = np.argsort(selected)
+              selected_sorted = selected[read_order]
+              restore_order = np.argsort(read_order)
+
+              train_dir = target / "train"
+              train_dir.mkdir(parents=True, exist_ok=True)
+              for name in ("features.npy", "vectors.npy", "labels.npy"):
+                  arr = np.load(source / "train" / name, mmap_mode="r")
+                  np.save(train_dir / name, arr[selected_sorted][restore_order])
+
+              for split in ("val", "test"):
+                  link = target / split
+                  if link.exists() or link.is_symlink():
+                      if link.is_dir() and not link.is_symlink():
+                          shutil.rmtree(link)
+                      else:
+                          link.unlink()
+                  link.symlink_to(source / split, target_is_directory=True)
+
+              print(f"Built balanced JetClass train subset at {target}")
+              print(f"Source: {source}")
+              print(f"Selected events: {len(selected)}")
+              print(f"Per-class counts: {counts}")
+              PY
+
+              test -f "$DATA_DIR/train/features.npy"
+              test -f "$DATA_DIR/train/vectors.npy"
+              test -f "$DATA_DIR/train/labels.npy"
+              test -f "$DATA_DIR/val/features.npy"
+              test -f "$DATA_DIR/val/vectors.npy"
+              test -f "$DATA_DIR/val/labels.npy"
+              test -f "$DATA_DIR/test/features.npy"
+              test -f "$DATA_DIR/test/vectors.npy"
+              test -f "$DATA_DIR/test/labels.npy"
+
+              cd "$REPO_DIR/scripts"
+              python3 -m py_compile train_transformer.py
+
+              echo "=== JetClass 1M: Transformer matched-FLOPs config (index=$IDX) ==="
+              python3 train_transformer.py \
+                --data_dir      "$DATA_DIR" \
+                --save_dir      "$SAVE_BASE/transformer/$RUN_TAG" \
+                --dataset       jetclass \
+                --sort_by       kt \
+                --num_particles 150 \
+                --d_model       8 \
+                --d_ff          32 \
+                --num_heads     2 \
+                --schedule      none \
+                --batch_size    1024 \
+                --num_epochs    500 \
+                --early_stopping_patience 50
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"

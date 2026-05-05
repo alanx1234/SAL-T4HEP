@@ -45,6 +45,7 @@ spec:
                   "label_QCD", "label_Hbb", "label_Hcc", "label_Hgg", "label_H4q",
                   "label_Hqql", "label_Zqq", "label_Wqq", "label_Tbqq", "label_Tbl",
               ]
+              SIGNAL_LABELS = LABELS[1:]
 
               RX_TEST_ACC = re.compile(r"Test\s*Accuracy:\s*([0-9]*\.?[0-9]+)", re.I)
               RX_ROC_AUC = re.compile(r"ROC\s*AUC:\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
@@ -78,11 +79,26 @@ spec:
                   mu = sum(xs) / len(xs)
                   return math.sqrt(sum((x - mu) ** 2 for x in xs) / (len(xs) - 1))
 
+              def compact_uncertainty(x):
+                  if x is None or not math.isfinite(x):
+                      return ""
+                  if abs(x) < 1e-12:
+                      return "0"
+                  if abs(x) < 0.001:
+                      return f"{x:.4f}".rstrip("0").rstrip(".")
+                  return f"{x:.3f}".rstrip("0").rstrip(".")
+
               def fmt(xs, nd_mean=4, nd_sd=4, scale=1.0):
                   vals = [x * scale for x in xs if x is not None and math.isfinite(x)]
                   if not vals:
                       return ""
-                  return f"{sum(vals) / len(vals):.{nd_mean}f} +/- {sd(vals):.{nd_sd}f}"
+                  return f"{sum(vals) / len(vals):.{nd_mean}f} ± {sd(vals):.{nd_sd}f}"
+
+              def fmt_roc(xs):
+                  vals = [x for x in xs if x is not None and math.isfinite(x)]
+                  if not vals:
+                      return ""
+                  return f"{sum(vals) / len(vals):.4f} ± {compact_uncertainty(sd(vals))}"
 
               def trial_logs(model_dir):
                   complete = []
@@ -108,26 +124,34 @@ spec:
                       continue
                   parsed = []
                   for d, text in entries:
-                      inv = defaultdict(list)
+                      inv_fpr = defaultdict(list)
+                      bg_rej = defaultdict(list)
                       for label, value in RX_INV_FPR.findall(text):
                           v = number(value)
                           if v is not None:
-                              inv[label.lower()].append(v)
+                              inv_fpr[label.lower()].append(v)
                       for label, value in RX_BG_REJ.findall(text):
                           v = number(value)
                           if v is not None:
-                              inv[label.lower()].append(v)
+                              bg_rej[label.lower()].append(v)
+                      inv = {}
+                      for key, vals in inv_fpr.items():
+                          if vals:
+                              inv[key] = vals[-1]
+                      for key, vals in bg_rej.items():
+                          if vals and key not in inv:
+                              inv[key] = vals[-1]
                       parsed.append({
                           "acc": last(RX_TEST_ACC, text, float),
                           "auc": last(RX_ROC_AUC, text, float),
                           "params": last(RX_TOTAL_PARAMS, text, int),
                           "flops": last(RX_FLOPS, text, int),
-                          "inv": {k: vals[-1] for k, vals in inv.items() if vals},
+                          "inv": inv,
                       })
                   row = {
                       "model": model,
                       "Test Accuracy (%)": fmt([p["acc"] for p in parsed], 2, 2, 100.0),
-                      "ROC AUC": fmt([p["auc"] for p in parsed], 4, 4),
+                      "ROC AUC": fmt_roc([p["auc"] for p in parsed]),
                       "# Params": str(next((p["params"] for p in parsed if p["params"] is not None), "")),
                       "FLOPs": str(next((p["flops"] for p in parsed if p["flops"] is not None), "")),
                   }
@@ -136,11 +160,11 @@ spec:
                       vals = [p["inv"].get(label.lower()) for p in parsed]
                       row[f"1/FPR {label}"] = fmt(vals, 4, 4)
                   for p in parsed:
-                      vals = [p["inv"].get(label.lower()) for label in LABELS]
+                      vals = [p["inv"].get(label.lower()) for label in SIGNAL_LABELS]
                       vals = [v for v in vals if v is not None and math.isfinite(v)]
                       if vals:
                           per_trial_avg.append(sum(vals) / len(vals))
-                  row["Avg 1/FPR"] = fmt(per_trial_avg, 4, 4)
+                  row["Avg 1/FPR"] = fmt(per_trial_avg, 2, 2)
                   rows.append(row)
 
               cols = (

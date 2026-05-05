@@ -20,7 +20,9 @@ spec:
             - name: SAVE_BASE
               value: "/j-jepa-vol/jetclass_2m_benchmark_runs"
             - name: MODELS
-              value: "jedi_linear,transformer,ptv3_config1,ptv3_config2,ptv3_config3,lorentznet,lgatr,salt_jetclass,part_d10_h2_pe4_jetclass,linformer_jetclass"
+              value: "jedi_linear,transformer,ptv3_config1,ptv3_config2,ptv3_config3,lorentznet,salt_jetclass,part_d10_h2_pe4_jetclass,linformer_jetclass"
+            - name: MODEL_ROOT_OVERRIDES
+              value: "part_d10_h2_pe4_jetclass=/j-jepa-vol/1p3mFLOPs_runs/part_d10_h2_pe4_jetclass/150/kt"
             - name: TRIALS
               value: "3"
           args:
@@ -41,17 +43,27 @@ spec:
 
               SAVE_BASE = Path(os.environ["SAVE_BASE"])
               MODELS = [m.strip() for m in os.environ["MODELS"].split(",") if m.strip()]
+              MODEL_ROOT_OVERRIDES = {}
+              for item in os.environ.get("MODEL_ROOT_OVERRIDES", "").split(","):
+                  item = item.strip()
+                  if not item:
+                      continue
+                  name, sep, path = item.partition("=")
+                  if sep and name.strip() and path.strip():
+                      MODEL_ROOT_OVERRIDES[name.strip()] = Path(path.strip())
               TRIALS = int(os.environ.get("TRIALS", "3"))
               LABELS = [
                   "label_QCD", "label_Hbb", "label_Hcc", "label_Hgg", "label_H4q",
                   "label_Hqql", "label_Zqq", "label_Wqq", "label_Tbqq", "label_Tbl",
               ]
+              SIGNAL_LABELS = LABELS[1:]
 
               RX_TEST_ACC = re.compile(r"Test\s*Accuracy:\s*([0-9]*\.?[0-9]+)", re.I)
               RX_ROC_AUC = re.compile(r"ROC\s*AUC:\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
               RX_TOTAL_PARAMS = re.compile(r"Total\s+params:\s*([0-9]+)", re.I)
               RX_FLOPS = re.compile(r"FLOPs\s*per\s*inference:\s*([0-9]+)", re.I)
               RX_INV_FPR = re.compile(r"1/FPR@0\.8\s+for\s+(\S+):\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
+              RX_BG_REJ = re.compile(r"Bg\s*rejection@0\.8\s+(\S+):\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
 
               def number(s):
                   try:
@@ -78,11 +90,26 @@ spec:
                   mu = sum(xs) / len(xs)
                   return math.sqrt(sum((x - mu) ** 2 for x in xs) / (len(xs) - 1))
 
+              def compact_uncertainty(x):
+                  if x is None or not math.isfinite(x):
+                      return ""
+                  if abs(x) < 1e-12:
+                      return "0"
+                  if abs(x) < 0.001:
+                      return f"{x:.4f}".rstrip("0").rstrip(".")
+                  return f"{x:.3f}".rstrip("0").rstrip(".")
+
               def fmt(xs, nd_mean=4, nd_sd=4, scale=1.0):
                   vals = [x * scale for x in xs if x is not None and math.isfinite(x)]
                   if not vals:
                       return ""
-                  return f"{sum(vals) / len(vals):.{nd_mean}f} +/- {sd(vals):.{nd_sd}f}"
+                  return f"{sum(vals) / len(vals):.{nd_mean}f} ± {sd(vals):.{nd_sd}f}"
+
+              def fmt_roc(xs):
+                  vals = [x for x in xs if x is not None and math.isfinite(x)]
+                  if not vals:
+                      return ""
+                  return f"{sum(vals) / len(vals):.4f} ± {compact_uncertainty(sd(vals))}"
 
               def trial_logs(model_dir):
                   complete = []
@@ -102,30 +129,43 @@ spec:
 
               rows = []
               for model in MODELS:
-                  entries, incomplete = trial_logs(SAVE_BASE / model)
+                  model_root = MODEL_ROOT_OVERRIDES.get(model, SAVE_BASE / model)
+                  entries, incomplete = trial_logs(model_root)
                   if incomplete:
-                      print(f"[WARN] {model}: ignored {len(incomplete)} incomplete trial logs under {SAVE_BASE / model}")
+                      print(f"[WARN] {model}: ignored {len(incomplete)} incomplete trial logs under {model_root}")
                   if len(entries) < TRIALS:
-                      print(f"[WARN] {model}: found {len(entries)}/{TRIALS} complete trials under {SAVE_BASE / model}")
+                      print(f"[WARN] {model}: found {len(entries)}/{TRIALS} complete trials under {model_root}")
                       continue
                   parsed = []
                   for d, text in entries:
-                      inv = defaultdict(list)
+                      inv_fpr = defaultdict(list)
+                      bg_rej = defaultdict(list)
                       for label, value in RX_INV_FPR.findall(text):
                           v = number(value)
                           if v is not None:
-                              inv[label.lower()].append(v)
+                              inv_fpr[label.lower()].append(v)
+                      for label, value in RX_BG_REJ.findall(text):
+                          v = number(value)
+                          if v is not None:
+                              bg_rej[label.lower()].append(v)
+                      inv = {}
+                      for key, vals in inv_fpr.items():
+                          if vals:
+                              inv[key] = vals[-1]
+                      for key, vals in bg_rej.items():
+                          if vals and key not in inv:
+                              inv[key] = vals[-1]
                       parsed.append({
                           "acc": last(RX_TEST_ACC, text, float),
                           "auc": last(RX_ROC_AUC, text, float),
                           "params": last(RX_TOTAL_PARAMS, text, int),
                           "flops": last(RX_FLOPS, text, int),
-                          "inv": {k: vals[-1] for k, vals in inv.items() if vals},
+                          "inv": inv,
                       })
                   row = {
                       "model": model,
                       "Test Accuracy (%)": fmt([p["acc"] for p in parsed], 2, 2, 100.0),
-                      "ROC AUC": fmt([p["auc"] for p in parsed], 4, 4),
+                      "ROC AUC": fmt_roc([p["auc"] for p in parsed]),
                       "# Params": str(next((p["params"] for p in parsed if p["params"] is not None), "")),
                       "FLOPs": str(next((p["flops"] for p in parsed if p["flops"] is not None), "")),
                   }
@@ -134,11 +174,13 @@ spec:
                       vals = [p["inv"].get(label.lower()) for p in parsed]
                       row[f"1/FPR {label}"] = fmt(vals, 4, 4)
                   for p in parsed:
-                      vals = [p["inv"].get(label.lower()) for label in LABELS]
+                      vals = [p["inv"].get(label.lower()) for label in SIGNAL_LABELS]
                       vals = [v for v in vals if v is not None and math.isfinite(v)]
                       if vals:
                           per_trial_avg.append(sum(vals) / len(vals))
-                  row["Avg 1/FPR"] = fmt(per_trial_avg, 4, 4)
+                  row["Avg 1/FPR"] = fmt(per_trial_avg, 2, 2)
+                  row["Avg Bg Rej"] = row["Avg 1/FPR"]
+                  row["_sort_perf"] = sum(per_trial_avg) / len(per_trial_avg) if per_trial_avg else float("-inf")
                   rows.append(row)
 
               cols = (
@@ -146,6 +188,8 @@ spec:
                   + [f"1/FPR {label}" for label in LABELS]
                   + ["Avg 1/FPR", "# Params", "FLOPs"]
               )
+              compact_cols = ["model", "Test Accuracy (%)", "ROC AUC", "Avg Bg Rej", "# Params", "FLOPs"]
+              compact_rows = sorted(rows, key=lambda row: row.get("_sort_perf", float("-inf")), reverse=True)
               if not rows:
                   raise SystemExit("[FATAL] No complete JetClass rows found")
               print("\n===== JetClass 2M Benchmark (Markdown) =====\n")
@@ -153,10 +197,19 @@ spec:
               print("| " + " | ".join(["---"] * len(cols)) + " |")
               for row in rows:
                   print("| " + " | ".join(str(row.get(c, "")) for c in cols) + " |")
+              print("\n===== JetClass 2M Benchmark Ranked Compact (Markdown) =====\n")
+              print("| " + " | ".join(compact_cols) + " |")
+              print("| " + " | ".join(["---"] * len(compact_cols)) + " |")
+              for row in compact_rows:
+                  print("| " + " | ".join(str(row.get(c, "")) for c in compact_cols) + " |")
               print("\n===== JetClass 2M Benchmark TSV =====\n")
               print("\t".join(cols))
               for row in rows:
                   print("\t".join(str(row.get(c, "")) for c in cols))
+              print("\n===== JetClass 2M Benchmark Ranked Compact TSV =====\n")
+              print("\t".join(compact_cols))
+              for row in compact_rows:
+                  print("\t".join(str(row.get(c, "")) for c in compact_cols))
               PY
 
               python /tmp/summarize_jetclass.py

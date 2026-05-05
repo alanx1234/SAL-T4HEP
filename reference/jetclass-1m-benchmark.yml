@@ -1,0 +1,342 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-jetclass-1m-benchmark
+  namespace: cms-ml
+spec:
+  completions: 24
+  parallelism: 8
+  completionMode: Indexed
+  backoffLimit: 4
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euxo pipefail
+
+              # indices 0-2:    JEDI-Linear trials 0,1,2
+              # indices 3-5:    PTv3 config1 trials 0,1,2
+              # indices 6-8:    PTv3 config2 trials 0,1,2
+              # indices 9-11:   PTv3 config3 trials 0,1,2
+              # indices 12-14:  SAL-T 1.3M-FLOPs config trials 0,1,2
+              # indices 15-17:  ParT 1.3M-FLOPs config trials 0,1,2
+              # indices 18-20:  Linformer 1.3M-FLOPs config trials 0,1,2
+              # indices 21-23:  LorentzNet unconstrained trials 0,1,2
+
+              IDX=$JOB_COMPLETION_INDEX
+              MODEL_IDX=$((IDX / 3))
+              TRIAL_IDX=$((IDX % 3))
+
+              REPO_DIR="/tmp/sal_t_jetclass_1m_benchmark"
+              REPO_REF="${REPO_REF:-iclr}"
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout "$REPO_REF"
+                git pull || true
+              else
+                git clone https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout "$REPO_REF"
+              fi
+
+              SOURCE_DATA_DIR="${SOURCE_DATA_DIR:-/j-jepa-vol/linformer_data/JetClass/kinematics_2m}"
+              DATA_DIR="${DATA_DIR:-/tmp/jetclass_1m_balanced_${IDX}}"
+              TRAIN_EVENTS="${TRAIN_EVENTS:-1000000}"
+              SAVE_BASE="${SAVE_BASE:-/j-jepa-vol/jetclass_1m_benchmark_runs}"
+              RUN_TAG="idx-${IDX}-trial-${TRIAL_IDX}"
+              export SOURCE_DATA_DIR DATA_DIR TRAIN_EVENTS
+              mkdir -p "$SAVE_BASE"
+
+              test -f "$SOURCE_DATA_DIR/train/features.npy"
+              test -f "$SOURCE_DATA_DIR/train/vectors.npy"
+              test -f "$SOURCE_DATA_DIR/train/labels.npy"
+              test -f "$SOURCE_DATA_DIR/val/features.npy"
+              test -f "$SOURCE_DATA_DIR/val/vectors.npy"
+              test -f "$SOURCE_DATA_DIR/val/labels.npy"
+              test -f "$SOURCE_DATA_DIR/test/features.npy"
+              test -f "$SOURCE_DATA_DIR/test/vectors.npy"
+              test -f "$SOURCE_DATA_DIR/test/labels.npy"
+
+              python3 - <<'PY'
+              import os
+              import shutil
+              from pathlib import Path
+
+              import numpy as np
+
+              source = Path(os.environ["SOURCE_DATA_DIR"])
+              target = Path(os.environ["DATA_DIR"])
+              train_events = int(os.environ.get("TRAIN_EVENTS", "1000000"))
+              seed = int(os.environ.get("SUBSET_SEED", "12345"))
+
+              rng = np.random.default_rng(seed)
+              labels = np.load(source / "train" / "labels.npy", mmap_mode="r")
+              class_ids = labels.argmax(axis=1) if labels.ndim == 2 else labels.astype(np.int64)
+              classes = np.arange(labels.shape[1] if labels.ndim == 2 else int(class_ids.max()) + 1)
+              per_class = train_events // len(classes)
+              remainder = train_events % len(classes)
+
+              chosen = []
+              counts = {}
+              for i, cls in enumerate(classes):
+                  available = np.flatnonzero(class_ids == cls)
+                  need = per_class + (1 if i < remainder else 0)
+                  if len(available) < need:
+                      raise SystemExit(
+                          f"Class {cls} has only {len(available)} training events, need {need}"
+                      )
+                  cls_choice = rng.choice(available, size=need, replace=False)
+                  chosen.append(cls_choice)
+                  counts[int(cls)] = int(need)
+
+              selected = np.concatenate(chosen)
+              rng.shuffle(selected)
+              read_order = np.argsort(selected)
+              selected_sorted = selected[read_order]
+              restore_order = np.argsort(read_order)
+
+              train_dir = target / "train"
+              train_dir.mkdir(parents=True, exist_ok=True)
+              for name in ("features.npy", "vectors.npy", "labels.npy"):
+                  arr = np.load(source / "train" / name, mmap_mode="r")
+                  np.save(train_dir / name, arr[selected_sorted][restore_order])
+
+              for split in ("val", "test"):
+                  link = target / split
+                  if link.exists() or link.is_symlink():
+                      if link.is_dir() and not link.is_symlink():
+                          shutil.rmtree(link)
+                      else:
+                          link.unlink()
+                  link.symlink_to(source / split, target_is_directory=True)
+
+              print(f"Built balanced JetClass train subset at {target}")
+              print(f"Source: {source}")
+              print(f"Selected events: {len(selected)}")
+              print(f"Per-class counts: {counts}")
+              PY
+
+              test -f "$DATA_DIR/train/features.npy"
+              test -f "$DATA_DIR/train/vectors.npy"
+              test -f "$DATA_DIR/train/labels.npy"
+              test -f "$DATA_DIR/val/features.npy"
+              test -f "$DATA_DIR/val/vectors.npy"
+              test -f "$DATA_DIR/val/labels.npy"
+              test -f "$DATA_DIR/test/features.npy"
+              test -f "$DATA_DIR/test/vectors.npy"
+              test -f "$DATA_DIR/test/labels.npy"
+
+              cd "$REPO_DIR/scripts"
+              python3 -m py_compile \
+                train_jedi_linear.py \
+                train_point_transformer.py \
+                train_lorentznet.py \
+                train_linformer.py \
+                train_part.py
+
+              if [ "$MODEL_IDX" -eq 0 ]; then
+                echo "=== JetClass 1M: JEDI-Linear (index=$IDX) ==="
+                python3 train_jedi_linear.py \
+                  --data_dir       "$DATA_DIR" \
+                  --save_dir       "$SAVE_BASE/jedi_linear/$RUN_TAG" \
+                  --dataset        jetclass \
+                  --sort_by        kt \
+                  --preset         custom \
+                  --embedding_dim  20 \
+                  --num_blocks     2 \
+                  --channel_hidden 40 \
+                  --head_hidden    20 \
+                  --aggregation    mean \
+                  --schedule       none \
+                  --batch_size     1024 \
+                  --num_epochs     500 \
+                  --early_stopping_patience 50
+
+              elif [ "$MODEL_IDX" -eq 1 ]; then
+                echo "=== JetClass 1M: PTv3 config1 (index=$IDX) ==="
+                python3 train_point_transformer.py \
+                  --data_dir             "$DATA_DIR" \
+                  --save_dir             "$SAVE_BASE/ptv3_config1/$RUN_TAG" \
+                  --dataset              jetclass \
+                  --sort_by              kt \
+                  --model_size           small \
+                  --enc_patch_sizes      10 \
+                  --ffn_activation       gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode learned_pool \
+                  --message_proj \
+                  --message_gated \
+                  --disable_pool \
+                  --schedule              none \
+                  --batch_size            1024 \
+                  --num_epochs            500 \
+                  --early_stopping_patience 50
+
+              elif [ "$MODEL_IDX" -eq 2 ]; then
+                echo "=== JetClass 1M: PTv3 config2 (index=$IDX) ==="
+                python3 train_point_transformer.py \
+                  --data_dir             "$DATA_DIR" \
+                  --save_dir             "$SAVE_BASE/ptv3_config2/$RUN_TAG" \
+                  --dataset              jetclass \
+                  --sort_by              kt \
+                  --model_size           small \
+                  --enc_patch_sizes      10 \
+                  --ffn_activation       gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode learned_pool \
+                  --message_proj \
+                  --no_message_gated \
+                  --schedule              none \
+                  --batch_size            1024 \
+                  --num_epochs            500 \
+                  --early_stopping_patience 50
+
+              elif [ "$MODEL_IDX" -eq 3 ]; then
+                echo "=== JetClass 1M: PTv3 config3 (index=$IDX) ==="
+                python3 train_point_transformer.py \
+                  --data_dir             "$DATA_DIR" \
+                  --save_dir             "$SAVE_BASE/ptv3_config3/$RUN_TAG" \
+                  --dataset              jetclass \
+                  --sort_by              kt \
+                  --model_size           small \
+                  --enc_patch_sizes      10 \
+                  --ffn_activation       gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode mean \
+                  --message_proj \
+                  --no_message_gated \
+                  --schedule              none \
+                  --batch_size            1024 \
+                  --num_epochs            500 \
+                  --early_stopping_patience 50
+
+              elif [ "$MODEL_IDX" -eq 4 ]; then
+                echo "=== JetClass 1M: SAL-T 1.3M-FLOPs config (index=$IDX) ==="
+                python3 train_linformer.py \
+                  --data_dir            "$DATA_DIR" \
+                  --save_dir            "$SAVE_BASE/salt_jetclass/$RUN_TAG" \
+                  --dataset             jetclass \
+                  --sort_by             kt \
+                  --cluster_E \
+                  --cluster_F \
+                  --convolution \
+                  --conv_filter_heights 1 3 5 \
+                  --schedule            none \
+                  --batch_size          1024 \
+                  --num_epochs          500 \
+                  --early_stopping_patience 50 \
+                  --num_particles       150 \
+                  --d_model             20 \
+                  --d_ff                40 \
+                  --num_heads           4 \
+                  --proj_dim            4 \
+                  --use_cpe \
+                  --cpe_k               8 \
+                  --grid_size           0.2 \
+                  --num_layers          1 \
+                  --aggregation         max \
+                  --ffn_activation      relu
+
+              elif [ "$MODEL_IDX" -eq 5 ]; then
+                echo "=== JetClass 1M: ParT 1.3M-FLOPs config (index=$IDX) ==="
+                python3 train_part.py \
+                  --data_dir        "$DATA_DIR" \
+                  --save_dir        "$SAVE_BASE/part_d10_h2_pe4_jetclass/$RUN_TAG" \
+                  --dataset         jetclass \
+                  --sort_by         kt \
+                  --num_particles   150 \
+                  --embed_dims      10 \
+                  --pair_embed_dims 4 \
+                  --pair_input_dim  4 \
+                  --num_heads       2 \
+                  --num_layers      1 \
+                  --num_cls_layers  1 \
+                  --schedule        none \
+                  --batch_size      1024 \
+                  --num_epochs      500 \
+                  --early_stopping_patience 50
+
+              elif [ "$MODEL_IDX" -eq 6 ]; then
+                echo "=== JetClass 1M: Linformer 1.3M-FLOPs config (index=$IDX) ==="
+                python3 train_linformer.py \
+                  --data_dir            "$DATA_DIR" \
+                  --save_dir            "$SAVE_BASE/linformer_jetclass/$RUN_TAG" \
+                  --dataset             jetclass \
+                  --sort_by             kt \
+                  --schedule            none \
+                  --batch_size          1024 \
+                  --num_epochs          500 \
+                  --early_stopping_patience 50 \
+                  --num_particles       150 \
+                  --d_model             24 \
+                  --d_ff                32 \
+                  --num_heads           2 \
+                  --proj_dim            4 \
+                  --use_cpe \
+                  --cpe_k               8 \
+                  --grid_size           0.2 \
+                  --num_layers          1 \
+                  --aggregation         max \
+                  --ffn_activation      relu
+
+              elif [ "$MODEL_IDX" -eq 7 ]; then
+                echo "=== JetClass 1M: LorentzNet unconstrained (index=$IDX) ==="
+                python3 train_lorentznet.py \
+                  --data_dir      "$DATA_DIR" \
+                  --save_dir      "$SAVE_BASE/lorentznet/$RUN_TAG" \
+                  --dataset       jetclass \
+                  --sort_by       kt \
+                  --num_particles 150 \
+                  --flops_batch_size 1 \
+                  --schedule      none \
+                  --batch_size    32 \
+                  --num_epochs    500 \
+                  --early_stopping_patience 50
+              fi
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "8"
+              nvidia.com/gpu: "1"

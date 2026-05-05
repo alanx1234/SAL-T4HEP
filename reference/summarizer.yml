@@ -108,6 +108,20 @@ spec:
                   sd = sample_sd(xs)
                   return f"{mu:.{nd_mean}f} \u00B1 {sd:.{nd_sd}f}"
 
+              def compact_uncertainty(x):
+                  if x is None or not math.isfinite(x):
+                      return ""
+                  if abs(x) < 1e-12:
+                      return "0"
+                  if abs(x) < 0.001:
+                      return f"{x:.4f}".rstrip("0").rstrip(".")
+                  return f"{x:.3f}".rstrip("0").rstrip(".")
+
+              def fmt_roc(xs):
+                  if not xs: return ""
+                  mu = sum(xs) / len(xs)
+                  return f"{mu:.4f} \u00B1 {compact_uncertainty(sample_sd(xs))}"
+
               def is_jetclass_log(text):
                   return any(lab.lower() in text.lower() for lab in JETCLASS_LABELS)
 
@@ -234,7 +248,7 @@ spec:
                           row = {
                               "model":             model_name,
                               "Test Accuracy (%)": fmt_pm(acc_pct,  nd_mean=2, nd_sd=2),
-                              "ROC AUC":           fmt_pm(auc_vals,  nd_mean=4, nd_sd=4),
+                              "ROC AUC":           fmt_roc(auc_vals),
                               "# Params":          str(params0),
                               "FLOPs":             str(flops0),
                           }
@@ -244,9 +258,9 @@ spec:
                           per_trial_avg = []
                           for m in parsed:
                               inv = m.get("inv_fpr", {})
-                              trial_vals = [inv[lab.lower()] for lab in JETCLASS_LABELS if inv.get(lab.lower()) is not None]
+                              trial_vals = [inv[lab.lower()] for lab in JETCLASS_LABELS[1:] if inv.get(lab.lower()) is not None]
                               if trial_vals: per_trial_avg.append(sum(trial_vals) / len(trial_vals))
-                          row["Avg 1/FPR"] = fmt_pm(per_trial_avg, nd_mean=4, nd_sd=4)
+                          row["Avg 1/FPR"] = fmt_pm(per_trial_avg, nd_mean=2, nd_sd=2)
                           jetclass_rows.append(row)
 
                       else:
@@ -264,11 +278,11 @@ spec:
                           row = {
                               "model":             model_name,
                               "Test Accuracy (%)": fmt_pm(acc_pct,  nd_mean=2, nd_sd=2),
-                              "ROC AUC":           fmt_pm(auc_vals,  nd_mean=4, nd_sd=4),
-                              "Bg Rej W":          fmt_pm(brw,       nd_mean=4, nd_sd=4),
-                              "Bg Rej Z":          fmt_pm(brz,       nd_mean=4, nd_sd=4),
-                              "Bg Rej t":          fmt_pm(brt,       nd_mean=4, nd_sd=4),
-                              "Avg Bg Rej":        fmt_pm(bravg,     nd_mean=4, nd_sd=4),
+                              "ROC AUC":           fmt_roc(auc_vals),
+                              "Bg Rej W":          fmt_pm(brw,       nd_mean=2, nd_sd=2),
+                              "Bg Rej Z":          fmt_pm(brz,       nd_mean=2, nd_sd=2),
+                              "Bg Rej t":          fmt_pm(brt,       nd_mean=2, nd_sd=2),
+                              "Avg Bg Rej":        fmt_pm(bravg,     nd_mean=2, nd_sd=2),
                               "# Params":          str(params0),
                               "FLOPs":             str(flops0),
                           }

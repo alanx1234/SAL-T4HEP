@@ -46,7 +46,6 @@ spec:
               RX_TOTAL_PARAMS = re.compile(r"Total\s+params:\s*([0-9]+)", re.I)
               RX_FLOPS = re.compile(r"FLOPs\s*per\s*inference:\s*([0-9]+)", re.I)
               RX_BR = re.compile(r"Bg\s*rejection@0\.8\s*(W|Z|t)\s*:\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
-              RX_AVG_BR = re.compile(r"Avg\s+bg\s+rejection@0\.8:\s*([0-9]*\.?[0-9]+|nan|inf)", re.I)
 
               def last(rx, text, cast=float):
                   hits = rx.findall(text)
@@ -73,11 +72,26 @@ spec:
                   mu = sum(xs) / len(xs)
                   return math.sqrt(sum((x - mu) ** 2 for x in xs) / (len(xs) - 1))
 
+              def compact_uncertainty(x):
+                  if x is None or not math.isfinite(x):
+                      return ""
+                  if abs(x) < 1e-12:
+                      return "0"
+                  if abs(x) < 0.001:
+                      return f"{x:.4f}".rstrip("0").rstrip(".")
+                  return f"{x:.3f}".rstrip("0").rstrip(".")
+
               def fmt(xs, nd_mean=4, nd_sd=4, scale=1.0):
                   vals = [x * scale for x in xs if x is not None and math.isfinite(x)]
                   if not vals:
                       return ""
-                  return f"{sum(vals) / len(vals):.{nd_mean}f} +/- {sd(vals):.{nd_sd}f}"
+                  return f"{sum(vals) / len(vals):.{nd_mean}f} ± {sd(vals):.{nd_sd}f}"
+
+              def fmt_roc(xs):
+                  vals = [x for x in xs if x is not None and math.isfinite(x)]
+                  if not vals:
+                      return ""
+                  return f"{sum(vals) / len(vals):.4f} ± {compact_uncertainty(sd(vals))}"
 
               def trial_logs(model_dir):
                   complete = []
@@ -108,7 +122,6 @@ spec:
                   br = {}
                   for label, value in RX_BR.findall(text):
                       br[label.lower()] = parse_float(value)
-                  avg_br = last(RX_AVG_BR, text, float)
                   parsed.append({
                       "trial_dir": str(d),
                       "acc": last(RX_TEST_ACC, text, float),
@@ -118,7 +131,6 @@ spec:
                       "br_w": br.get("w"),
                       "br_z": br.get("z"),
                       "br_t": br.get("t"),
-                      "avg_br": avg_br,
                   })
 
               avg_from_classes = []
@@ -127,17 +139,14 @@ spec:
                   vals = [v for v in vals if v is not None and math.isfinite(v)]
                   if len(vals) == 3:
                       avg_from_classes.append(sum(vals) / 3.0)
-              avg_br_vals = [p["avg_br"] for p in parsed if p["avg_br"] is not None]
-              avg_vals = avg_br_vals or avg_from_classes
-
               rows = [{
                   "model": MODEL_DIR,
                   "Test Accuracy (%)": fmt([p["acc"] for p in parsed], 2, 2, 100.0),
-                  "ROC AUC": fmt([p["auc"] for p in parsed], 4, 4),
-                  "Bg Rej W": fmt([p["br_w"] for p in parsed], 4, 4),
-                  "Bg Rej Z": fmt([p["br_z"] for p in parsed], 4, 4),
-                  "Bg Rej t": fmt([p["br_t"] for p in parsed], 4, 4),
-                  "Avg Bg Rej": fmt(avg_vals, 4, 4),
+                  "ROC AUC": fmt_roc([p["auc"] for p in parsed]),
+                  "Bg Rej W": fmt([p["br_w"] for p in parsed], 2, 2),
+                  "Bg Rej Z": fmt([p["br_z"] for p in parsed], 2, 2),
+                  "Bg Rej t": fmt([p["br_t"] for p in parsed], 2, 2),
+                  "Avg Bg Rej": fmt(avg_from_classes, 2, 2),
                   "# Params": str(next((p["params"] for p in parsed if p["params"] is not None), "")),
                   "FLOPs": str(next((p["flops"] for p in parsed if p["flops"] is not None), "")),
               }]

@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 *.pdf
+weaver-core
+efficient_particle_transformer
