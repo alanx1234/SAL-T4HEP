@@ -27,10 +27,11 @@ class Serialization2D(layers.Layer):
         z = tf.zeros_like(x)
 
         one = tf.constant(1, dtype=tf.int64)
-        # Interleave bits (up to 30 bits for common precision); ensure int64 loop var
-        for i in tf.range(30, dtype=tf.int64):
-            mask_x = (tf.bitwise.right_shift(x, i) & one)
-            mask_y = (tf.bitwise.right_shift(y, i) & one)
+        # Interleave bits with a static Python loop so graph tracing stays simple.
+        for i in range(30):
+            shift = tf.constant(i, dtype=tf.int64)
+            mask_x = (tf.bitwise.right_shift(x, shift) & one)
+            mask_y = (tf.bitwise.right_shift(y, shift) & one)
 
             z = z | tf.bitwise.left_shift(mask_x, 2 * i)
             z = z | tf.bitwise.left_shift(mask_y, 2 * i + 1)
@@ -409,15 +410,16 @@ def build_ptv3_serialized_jet_classifier(
     aggregation="max",
     serialize_by="morton",
     use_pool=True,
+    assume_serialized_input=False,
 ):
     """Build hierarchical PTv3-inspired jet classifier with serialization."""
     
     # Input: [pt, eta, phi]
     features_input = layers.Input((num_particles, 3), name="features")
     
-    # Extract coordinates
-    # Pass full triplet for flexible sorting (pt, eta, phi)
-    coords = features_input[..., 0:3]
+    # Keep the full triplet only for serialization keys; blocks operate on (eta, phi).
+    sort_coords = features_input[..., 0:3]
+    coords = features_input[..., 1:3]
     
     # Initial projection
     x = layers.Dense(enc_dims[0], activation="relu")(features_input)
@@ -425,8 +427,10 @@ def build_ptv3_serialized_jet_classifier(
     # ------------------ START Serialization Injection ------------------
     # Step 1: Serialize the initial point cloud.
     # All subsequent layers (Blocks and Pooling) operate on this sorted sequence.
-    # Choose sorting with sort_by: "morton" (default), "pt", or "kt"
-    x, coords = Serialization2D(grid_size=grid_size, sort_by=serialize_by)([x, coords])
+    # Choose sorting with sort_by: "morton" (default), "pt", or "kt".
+    if not assume_serialized_input:
+        x, sort_coords = Serialization2D(grid_size=grid_size, sort_by=serialize_by)([x, sort_coords])
+        coords = sort_coords[..., 1:3]
     # ------------------- END Serialization Injection -------------------
     
     # Hierarchical encoder

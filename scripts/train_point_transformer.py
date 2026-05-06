@@ -19,7 +19,7 @@ import random
 import math
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_curve, auc, roc_auc_score
 import matplotlib.pyplot as plt
@@ -45,6 +45,58 @@ def parse_training_schedule(schedule, batch_size, num_epochs):
 		if not parsed:
 				raise ValueError("Training schedule is empty")
 		return parsed
+
+
+def _format_log_value(value):
+		if value is None:
+				return "NA"
+		try:
+				return f"{float(value):.6f}"
+		except Exception:
+				return str(value)
+
+
+class LoggingProgressCallback(Callback):
+		def __init__(self, log_every_batches=100):
+				super().__init__()
+				self.log_every_batches = int(log_every_batches or 0)
+				self.epoch_start_time = None
+				self.batch_start_time = None
+
+		def on_epoch_begin(self, epoch, logs=None):
+				self.epoch_start_time = time.perf_counter()
+				logging.info("Epoch %d begin", epoch + 1)
+
+		def on_train_batch_begin(self, batch, logs=None):
+				if self.log_every_batches:
+						self.batch_start_time = time.perf_counter()
+
+		def on_train_batch_end(self, batch, logs=None):
+				if not self.log_every_batches:
+						return
+				if (batch + 1) == 1 or (batch + 1) % self.log_every_batches == 0:
+						logs = logs or {}
+						elapsed = 0.0 if self.batch_start_time is None else time.perf_counter() - self.batch_start_time
+						logging.info(
+								"Train batch %d end: loss=%s accuracy=%s batch_time=%.2fs",
+								batch + 1,
+								_format_log_value(logs.get("loss")),
+								_format_log_value(logs.get("accuracy")),
+								elapsed,
+						)
+
+		def on_epoch_end(self, epoch, logs=None):
+				logs = logs or {}
+				elapsed = 0.0 if self.epoch_start_time is None else time.perf_counter() - self.epoch_start_time
+				logging.info(
+						"Epoch %d end: loss=%s accuracy=%s val_loss=%s val_accuracy=%s epoch_time=%.2fs",
+						epoch + 1,
+						_format_log_value(logs.get("loss")),
+						_format_log_value(logs.get("accuracy")),
+						_format_log_value(logs.get("val_loss")),
+						_format_log_value(logs.get("val_accuracy")),
+						elapsed,
+				)
 
 
 # ---------------------------
@@ -352,6 +404,7 @@ def parse_args():
 		)
 		p.add_argument("--batch_size", type=int, default=4096)
 		p.add_argument("--test_batch_size", type=int, default=None)
+		p.add_argument("--log_every_batches", type=int, default=100, help="Write training progress to train.log/stdout every N batches; 0 disables")
 		p.add_argument("--num_epochs", type=int, default=500)
 		p.add_argument(
 				"--schedule",
@@ -381,6 +434,7 @@ def parse_args():
 		p.add_argument("--model_size", choices=["small", "small_2layer_no_downsamp", "small_2layer_2_downsamp", "matched", "medium", "large"], default="small")
 		p.add_argument('--use_serialized_model', action='store_true', help='Use the serialized version of the PointTransformer model')
 		p.add_argument('--serialize_by', choices=['morton','pt','kt'], default='morton', help='Serialization  strategy when using the serialized model')
+		p.add_argument('--assume_serialized_input', action='store_true', help='Skip in-model serialization when inputs are already sorted by --sort_by')
 		p.add_argument('--use_jedi_hybrid', action='store_true', help='Use JEDI-PTv3 Hybrid (O(N) global interaction instead of attention)')
 		p.add_argument('--disable_cpe', action='store_true', help='Disable CPE in JEDI hybrid (for pure JEDI-style permutation invariance)')
 		p.add_argument("--ffn_activation", choices=["relu", "gelu", "swish", "silu", "tanh"], default="gelu", help="Activation function for feed-forward network (relu is fastest, gelu is default)")
@@ -443,10 +497,12 @@ def main():
 		os.makedirs(save_dir, exist_ok=True)
 
 		logging.basicConfig(
-				filename=os.path.join(save_dir, "train.log"),
-				filemode="w",
 				level=logging.INFO,
 				format="%(asctime)s %(levelname)s %(message)s",
+				handlers=[
+						logging.FileHandler(os.path.join(save_dir, "train.log"), mode="w"),
+						logging.StreamHandler(sys.stdout),
+				],
 		)
 		logging.info("Args: %s", args)
 
@@ -580,6 +636,7 @@ def main():
 				dropout=args.dropout,
 				aggregation=args.aggregation,
 				serialize_by=args.serialize_by,
+				assume_serialized_input=args.assume_serialized_input,
 			)
 		else:
 			model = build_ptv3_jet_classifier(
@@ -655,6 +712,7 @@ def main():
 		early = EarlyStopping(
 				monitor="val_loss", patience=args.early_stopping_patience, restore_best_weights=True, verbose=1
 		)
+		progress = LoggingProgressCallback(args.log_every_batches)
 
 		schedule = parse_training_schedule(args.schedule, args.batch_size, args.num_epochs)
 		logging.info("Training schedule: %s", schedule)
@@ -670,7 +728,7 @@ def main():
 						initial_epoch=ce,
 						epochs=ce + ep,
 						batch_size=bs,
-						callbacks=[ckpt, early],
+						callbacks=[ckpt, early, progress],
 						verbose=1,
 				)
 				histories.append(hist)

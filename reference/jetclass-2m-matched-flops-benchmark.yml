@@ -116,9 +116,11 @@ spec:
                   --aggregation     max \
                   --use_serialized_model \
                   --serialize_by    kt \
+                  --assume_serialized_input \
                   --schedule        none \
                   --batch_size      512 \
                   --test_batch_size 512 \
+                  --log_every_batches 100 \
                   --num_epochs      500 \
                   --early_stopping_patience 50
               fi
