@@ -1,0 +1,110 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-jetclass-eval
+  namespace: cms-ml
+  labels:
+    jobgroup: jetclass-multiplicity-eval
+spec:
+  completions: 8
+  parallelism: 8
+  completionMode: Indexed
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        jobgroup: jetclass-multiplicity-eval
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      containers:
+        - name: evaluation
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONIOENCODING
+              value: "utf-8"
+            - name: LC_ALL
+              value: "C.UTF-8"
+            - name: REPO_REF
+              value: "iclr"
+            - name: DATA_DIR
+              value: "/j-jepa-vol/linformer_data/JetClass/kinematics_2m"
+            - name: CHUNK_SIZE
+              value: "65536"
+            - name: SCORE_BINS
+              value: "4096"
+            - name: POST_RUN_SLEEP_SECONDS
+              value: "3600"
+          args:
+            - |
+              set -euo pipefail
+
+              MODELS=(
+                phatjet
+                jedi_linear
+                transformer
+                salt
+                linformer
+                part_small
+                pointnet
+                pointtransformer_serialized
+              )
+              MODEL="${MODELS[$JOB_COMPLETION_INDEX]}"
+              REPO_DIR="/tmp/sal_t_jetclass_eval"
+
+              git clone --branch "$REPO_REF" --single-branch \
+                https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+              cd "$REPO_DIR"
+
+              test -f "$DATA_DIR/test/features.npy"
+              test -f "$DATA_DIR/test/labels.npy"
+              python3 -m py_compile scripts/evaluate_jetclass_multiplicity.py
+
+              echo "Starting model=$MODEL indexed_completion=$JOB_COMPLETION_INDEX"
+              python3 scripts/evaluate_jetclass_multiplicity.py \
+                --model "$MODEL" \
+                --data-dir "$DATA_DIR" \
+                --chunk-size "$CHUNK_SIZE" \
+                --score-bins "$SCORE_BINS"
+
+              echo "Evaluation finished; sleeping for log retrieval"
+              sleep "$POST_RUN_SLEEP_SECONDS"
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+              readOnly: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: 24Gi
+              ephemeral-storage: 4Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 24Gi
+              ephemeral-storage: 4Gi
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
