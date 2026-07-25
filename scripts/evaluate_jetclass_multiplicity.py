@@ -360,21 +360,54 @@ def make_part_model():
     )
 
 
+def _load_tensorflow_checkpoint(model_name: str, checkpoint: Path, trial: int):
+    """Load Keras weights, handling mixed Keras 2/3 checkpoint conventions."""
+    attempts = [checkpoint]
+    final_checkpoint = checkpoint.with_name("model.weights.h5")
+    if final_checkpoint.is_file() and final_checkpoint != checkpoint:
+        attempts.append(final_checkpoint)
+
+    errors = []
+    for candidate in attempts:
+        for use_legacy_name in (False, True):
+            model = make_tensorflow_model(model_name)
+            load_path = candidate
+            alias = None
+            if use_legacy_name:
+                alias = Path("/tmp") / f"{model_name}-trial-{trial}-{candidate.stem}.h5"
+                if alias.exists() or alias.is_symlink():
+                    alias.unlink()
+                alias.symlink_to(candidate)
+                load_path = alias
+            try:
+                model.load_weights(load_path)
+                method = "legacy-h5-alias" if use_legacy_name else "direct"
+                return model, candidate, method
+            except Exception as error:
+                errors.append(
+                    f"{candidate} ({'legacy alias' if use_legacy_name else 'direct'}): "
+                    f"{type(error).__name__}: {error}"
+                )
+            finally:
+                if alias is not None and (alias.exists() or alias.is_symlink()):
+                    alias.unlink()
+    raise RuntimeError(
+        f"Could not load {model_name} trial {trial}. Attempts:\n"
+        + "\n".join(errors)
+    )
+
+
 def load_models(spec: ModelSpec, checkpoints: list[Path]):
     if spec.framework == "tensorflow":
-        import tensorflow as tf
-
         models = []
-        for checkpoint in checkpoints:
-            model = make_tensorflow_model(spec.name)
-            try:
-                model.load_weights(checkpoint)
-            except Exception:
-                if spec.name != "pointnet":
-                    raise
-                model = tf.keras.models.load_model(checkpoint, compile=False)
+        loaded = []
+        for trial, checkpoint in enumerate(checkpoints):
+            model, actual_checkpoint, method = _load_tensorflow_checkpoint(
+                spec.name, checkpoint, trial
+            )
             models.append(model)
-        return models
+            loaded.append((actual_checkpoint, method))
+        return models, loaded
 
     import torch
 
@@ -389,7 +422,7 @@ def load_models(spec: ModelSpec, checkpoints: list[Path]):
         model.load_state_dict(state)
         model.eval()
         models.append(model)
-    return models
+    return models, [(checkpoint, "torch-state-dict") for checkpoint in checkpoints]
 
 
 def prepare_part_inputs(features: np.ndarray):
@@ -436,6 +469,8 @@ class BinnedMetrics:
         shape = (len(ATOMIC_BINS), len(LABELS), score_bins)
         self.data = {
             "events": np.zeros(len(ATOMIC_BINS), dtype=np.int64),
+            "valid_events": np.zeros(len(ATOMIC_BINS), dtype=np.int64),
+            "nonfinite_events": np.zeros(len(ATOMIC_BINS), dtype=np.int64),
             "correct": np.zeros(len(ATOMIC_BINS), dtype=np.int64),
             "class_counts": np.zeros(
                 (len(ATOMIC_BINS), len(LABELS)), dtype=np.int64
@@ -461,16 +496,28 @@ class BinnedMetrics:
         predictions: np.ndarray,
     ) -> None:
         truth_index = np.argmax(truth, axis=1)
-        pred_index = np.argmax(predictions, axis=1)
+        finite = np.all(np.isfinite(predictions), axis=1)
+        safe_predictions = np.nan_to_num(
+            predictions, nan=0.0, posinf=1.0, neginf=0.0
+        )
+        pred_index = np.argmax(safe_predictions, axis=1)
         score_index = np.minimum(
-            (np.clip(predictions, 0.0, 1.0) * self.score_bins).astype(np.int64),
+            (np.clip(safe_predictions, 0.0, 1.0) * self.score_bins).astype(
+                np.int64
+            ),
             self.score_bins - 1,
         )
         ids = self._bin_ids(particle_counts)
         if np.any(ids < 0):
             raise ValueError("Particle counts were not covered by the atomic bins")
         self.data["events"] += np.bincount(ids, minlength=len(ATOMIC_BINS))
-        correct_ids = ids[truth_index == pred_index]
+        self.data["valid_events"] += np.bincount(
+            ids[finite], minlength=len(ATOMIC_BINS)
+        )
+        self.data["nonfinite_events"] += np.bincount(
+            ids[~finite], minlength=len(ATOMIC_BINS)
+        )
+        correct_ids = ids[finite & (truth_index == pred_index)]
         self.data["correct"] += np.bincount(
             correct_ids, minlength=len(ATOMIC_BINS)
         )
@@ -484,18 +531,19 @@ class BinnedMetrics:
             + pred_index
         )
         self.data["confusion"] += np.bincount(
-            confusion_key,
+            confusion_key[finite],
             minlength=len(ATOMIC_BINS) * len(LABELS) * len(LABELS),
         ).reshape(len(ATOMIC_BINS), len(LABELS), len(LABELS))
         for class_index in range(len(LABELS)):
             score_key = ids * self.score_bins + score_index[:, class_index]
-            positive = truth_index == class_index
+            positive = finite & (truth_index == class_index)
+            negative = finite & (truth_index != class_index)
             self.data["positive_scores"][:, class_index] += np.bincount(
                 score_key[positive],
                 minlength=len(ATOMIC_BINS) * self.score_bins,
             ).reshape(len(ATOMIC_BINS), self.score_bins)
             self.data["negative_scores"][:, class_index] += np.bincount(
-                score_key[~positive],
+                score_key[negative],
                 minlength=len(ATOMIC_BINS) * self.score_bins,
             ).reshape(len(ATOMIC_BINS), self.score_bins)
 
@@ -525,6 +573,10 @@ class BinnedMetrics:
                 if not atoms:
                     raise RuntimeError(f"No atomic bins found for {label}")
                 events = int(self.data["events"][atoms].sum())
+                valid_events = int(self.data["valid_events"][atoms].sum())
+                nonfinite_events = int(
+                    self.data["nonfinite_events"][atoms].sum()
+                )
                 positive_scores = self.data["positive_scores"][atoms].sum(axis=0)
                 negative_scores = self.data["negative_scores"][atoms].sum(axis=0)
                 class_counts = self.data["class_counts"][atoms].sum(axis=0)
@@ -543,6 +595,8 @@ class BinnedMetrics:
                         "low": low,
                         "high": high,
                         "n_events": events,
+                        "n_valid_predictions": valid_events,
+                        "n_nonfinite_predictions": nonfinite_events,
                         "accuracy": (
                             float(self.data["correct"][atoms].sum() / events)
                             if events
@@ -597,6 +651,12 @@ def aggregate_trials(trial_results: list[dict]) -> dict:
                     "low": low,
                     "high": high,
                     "n_events": trial_results[0][scheme][bin_index]["n_events"],
+                    "n_nonfinite_predictions": [
+                        trial_results[trial][scheme][bin_index][
+                            "n_nonfinite_predictions"
+                        ]
+                        for trial in range(len(trial_results))
+                    ],
                     "accuracy_mean": accuracy_mean,
                     "accuracy_std": accuracy_std,
                     "macro_ovr_auc_mean": auc_mean,
@@ -615,11 +675,12 @@ def print_markdown(model_name: str, aggregate: dict) -> None:
 
     for scheme in ("fine", "coarse", "overall"):
         print(f"\n===== {model_name}: {scheme} multiplicity bins =====")
-        print("| bin | N jets | accuracy | macro OvR AUC |")
-        print("|---:|---:|---:|---:|")
+        print("| bin | N jets | non-finite predictions by trial | accuracy | macro OvR AUC |")
+        print("|---:|---:|---:|---:|---:|")
         for row in aggregate[scheme]:
             print(
                 f"| {row['bin']} | {row['n_events']} | "
+                f"{','.join(str(value) for value in row['n_nonfinite_predictions'])} | "
                 f"{format_metric(row['accuracy_mean'], row['accuracy_std'])} | "
                 f"{format_metric(row['macro_ovr_auc_mean'], row['macro_ovr_auc_std'])} |"
             )
@@ -653,7 +714,12 @@ def main() -> None:
         for gpu in tf.config.list_physical_devices("GPU"):
             tf.config.experimental.set_memory_growth(gpu, True)
 
-    models = load_models(spec, checkpoints)
+    models, loaded_checkpoints = load_models(spec, checkpoints)
+    for trial, (checkpoint, method) in enumerate(loaded_checkpoints):
+        print(
+            f"trial={trial} loaded_checkpoint={checkpoint} load_method={method}",
+            flush=True,
+        )
     features_path = Path(args.data_dir) / "test" / "features.npy"
     labels_path = Path(args.data_dir) / "test" / "labels.npy"
     features = np.load(features_path, mmap_mode="r")
@@ -702,7 +768,11 @@ def main() -> None:
         "particle_count_definition": "count(abs(pt) > 1e-6) before sorting",
         "auc_method": "macro one-vs-rest from uniformly quantized score histograms",
         "score_bins": args.score_bins,
-        "checkpoints": [str(path) for path in checkpoints],
+        "requested_checkpoints": [str(path) for path in checkpoints],
+        "loaded_checkpoints": [
+            {"path": str(path), "method": method}
+            for path, method in loaded_checkpoints
+        ],
         "trials": trial_results,
         "aggregate": aggregate,
     }

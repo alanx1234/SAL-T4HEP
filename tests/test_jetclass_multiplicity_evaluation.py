@@ -52,3 +52,19 @@ def test_trial_aggregation_uses_sample_standard_deviation():
     overall = aggregate["overall"][0]
     assert overall["accuracy_mean"] == 0.5
     assert np.isclose(overall["accuracy_std"], math.sqrt(0.5))
+
+
+def test_nonfinite_predictions_are_counted_and_do_not_crash_auc_histogram():
+    metrics = BinnedMetrics(score_bins=10)
+    counts = np.array([10, 10])
+    truth = np.eye(10, dtype=np.float32)[[0, 1]]
+    predictions = np.eye(10, dtype=np.float32)[[0, 1]]
+    predictions[1, :] = np.nan
+
+    metrics.update(counts, truth, predictions)
+    result = metrics.result()["overall"][0]
+
+    assert result["n_events"] == 2
+    assert result["n_valid_predictions"] == 1
+    assert result["n_nonfinite_predictions"] == 1
+    assert result["accuracy"] == 0.5
