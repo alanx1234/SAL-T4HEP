@@ -484,7 +484,9 @@ class BinnedMetrics:
 
     @staticmethod
     def _bin_ids(counts: np.ndarray) -> np.ndarray:
-        result = np.full(len(counts), -1, dtype=np.int16)
+        # int64 is required because bin IDs are multiplied by score_bins
+        # (4096 by default); int16 overflows for the highest multiplicity bins.
+        result = np.full(len(counts), -1, dtype=np.int64)
         for index, (_, low, high) in enumerate(ATOMIC_BINS):
             result[(counts >= low) & (counts <= high)] = index
         return result

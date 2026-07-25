@@ -68,3 +68,17 @@ def test_nonfinite_predictions_are_counted_and_do_not_crash_auc_histogram():
     assert result["n_valid_predictions"] == 1
     assert result["n_nonfinite_predictions"] == 1
     assert result["accuracy"] == 0.5
+
+
+def test_150_particle_bin_does_not_overflow_score_histogram_key():
+    metrics = BinnedMetrics(score_bins=4096)
+    counts = np.array([150])
+    truth = np.eye(10, dtype=np.float32)[[9]]
+    predictions = np.eye(10, dtype=np.float32)[[9]]
+
+    metrics.update(counts, truth, predictions)
+    result = metrics.result()
+
+    assert result["fine"][-1]["n_events"] == 1
+    assert result["fine"][-1]["accuracy"] == 1.0
+    assert result["overall"][0]["n_nonfinite_predictions"] == 0
