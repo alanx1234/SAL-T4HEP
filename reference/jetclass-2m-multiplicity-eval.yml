@@ -9,7 +9,7 @@ spec:
   completions: 8
   parallelism: 8
   completionMode: Indexed
-  backoffLimitPerIndex: 2
+  backoffLimitPerIndex: 10
   template:
     metadata:
       labels:

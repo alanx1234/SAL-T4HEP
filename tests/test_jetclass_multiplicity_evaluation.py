@@ -1,8 +1,15 @@
 import math
+import tempfile
+from pathlib import Path
 
 import numpy as np
 
-from scripts.evaluate_jetclass_multiplicity import BinnedMetrics, aggregate_trials
+from scripts.evaluate_jetclass_multiplicity import (
+    BinnedMetrics,
+    ModelSpec,
+    aggregate_trials,
+    resolve_checkpoints,
+)
 
 
 def test_binned_metrics_counts_accuracy_and_auc():
@@ -82,3 +89,38 @@ def test_150_particle_bin_does_not_overflow_score_histogram_key():
     assert result["fine"][-1]["n_events"] == 1
     assert result["fine"][-1]["accuracy"] == 1.0
     assert result["overall"][0]["n_nonfinite_predictions"] == 0
+
+
+def test_checkpoint_resolver_pins_canonical_inner_trials():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for trial, (outer, inner) in enumerate(zip((10, 11, 12), (1, 0, 2))):
+            canonical = (
+                root
+                / f"idx-{outer}-trial-{trial}"
+                / "150"
+                / "kt"
+                / f"trial-{inner}"
+                / "best.weights.h5"
+            )
+            canonical.parent.mkdir(parents=True)
+            canonical.touch()
+            newer = canonical.parents[1] / "trial-99" / "best.weights.h5"
+            newer.parent.mkdir(parents=True)
+            newer.touch()
+
+        spec = ModelSpec(
+            name="test_model",
+            framework="tensorflow",
+            root=str(root),
+            outer_indices=(10, 11, 12),
+            inner_trials=(1, 0, 2),
+            batch_size=1,
+        )
+        selected = resolve_checkpoints(spec)
+
+    assert [_inner.parent.name for _inner in selected] == [
+        "trial-1",
+        "trial-0",
+        "trial-2",
+    ]

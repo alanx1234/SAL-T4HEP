@@ -81,6 +81,7 @@ class ModelSpec:
     framework: str
     root: str
     outer_indices: tuple[int, int, int] | None
+    inner_trials: tuple[int, int, int] | None
     batch_size: int
 
 
@@ -90,6 +91,7 @@ MODEL_SPECS = {
         "tensorflow",
         "/j-jepa-vol/jetclass_2m_benchmark_runs/ptv3_config1",
         (6, 7, 8),
+        (1, 0, 0),
         512,
     ),
     "jedi_linear": ModelSpec(
@@ -97,6 +99,7 @@ MODEL_SPECS = {
         "tensorflow",
         "/j-jepa-vol/jetclass_2m_benchmark_runs/jedi_linear",
         (0, 1, 2),
+        (0, 0, 0),
         2048,
     ),
     "transformer": ModelSpec(
@@ -104,6 +107,7 @@ MODEL_SPECS = {
         "tensorflow",
         "/j-jepa-vol/jetclass_2m_benchmark_runs/transformer",
         (3, 4, 5),
+        (0, 0, 0),
         1024,
     ),
     "salt": ModelSpec(
@@ -111,6 +115,7 @@ MODEL_SPECS = {
         "tensorflow",
         "/j-jepa-vol/jetclass_2m_benchmark_runs/salt_jetclass",
         (15, 16, 17),
+        (1, 1, 0),
         1024,
     ),
     "linformer": ModelSpec(
@@ -118,12 +123,14 @@ MODEL_SPECS = {
         "tensorflow",
         "/j-jepa-vol/jetclass_2m_benchmark_runs/linformer_jetclass",
         (18, 19, 20),
+        (1, 0, 1),
         1024,
     ),
     "part_small": ModelSpec(
         "part_small",
         "pytorch",
         "/j-jepa-vol/1p3mFLOPs_runs/part_d10_h2_pe4_jetclass/150/kt",
+        None,
         None,
         1024,
     ),
@@ -132,6 +139,7 @@ MODEL_SPECS = {
         "tensorflow",
         "/j-jepa-vol/jetclass_2m_matched_flops_runs/pointnet",
         (0, 1, 2),
+        (5, 4, 4),
         2048,
     ),
     "pointtransformer_serialized": ModelSpec(
@@ -139,6 +147,7 @@ MODEL_SPECS = {
         "tensorflow",
         "/j-jepa-vol/jetclass_2m_matched_flops_runs/ptv3_serialized",
         (0, 1, 2),
+        (0, 0, 0),
         512,
     ),
 }
@@ -155,6 +164,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--score-bins", type=int, default=4096)
     parser.add_argument("--checkpoint-root", default=None)
+    parser.add_argument(
+        "--load-only",
+        action="store_true",
+        help="Resolve and load all three checkpoints, then exit before reading data",
+    )
     return parser.parse_args()
 
 
@@ -178,22 +192,29 @@ def resolve_checkpoints(spec: ModelSpec, root_override: str | None = None) -> li
         return selected
 
     assert spec.outer_indices is not None
+    assert spec.inner_trials is not None
     for trial, outer_index in enumerate(spec.outer_indices):
         outer_dirs = sorted(root.glob(f"*idx-{outer_index}-trial-{trial}"))
         # Some early serialized runs used trial-numbered outer indices without
         # the benchmark's global completion-index offset.
         if not outer_dirs and spec.name == "pointtransformer_serialized":
             outer_dirs = sorted(root.glob(f"*idx-{trial + 3}-trial-{trial}"))
+        expected_inner_trial = spec.inner_trials[trial]
         candidates = []
         for outer_dir in outer_dirs:
-            candidates.extend(outer_dir.rglob("best.weights.h5"))
+            candidates.extend(
+                path
+                for path in outer_dir.rglob("best.weights.h5")
+                if _inner_trial(path) == expected_inner_trial
+            )
         candidates = [path for path in candidates if path.is_file()]
         if not candidates:
             raise FileNotFoundError(
                 f"No best.weights.h5 for {spec.name} trial={trial}, "
-                f"outer_index={outer_index}, root={root}"
+                f"outer_index={outer_index}, inner_trial={expected_inner_trial}, "
+                f"root={root}"
             )
-        candidates.sort(key=lambda path: (_inner_trial(path), path.stat().st_mtime, path.as_posix()))
+        candidates.sort(key=lambda path: (path.stat().st_mtime, path.as_posix()))
         selected.append(candidates[-1])
     return selected
 
@@ -722,6 +743,9 @@ def main() -> None:
             f"trial={trial} loaded_checkpoint={checkpoint} load_method={method}",
             flush=True,
         )
+    if args.load_only:
+        print(f"LOAD_ONLY_OK model={spec.name}", flush=True)
+        return
     features_path = Path(args.data_dir) / "test" / "features.npy"
     labels_path = Path(args.data_dir) / "test" / "labels.npy"
     features = np.load(features_path, mmap_mode="r")
