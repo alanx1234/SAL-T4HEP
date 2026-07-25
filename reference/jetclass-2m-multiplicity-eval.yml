@@ -95,9 +95,9 @@ spec:
               readOnly: true
           resources:
             requests:
-              cpu: "4"
-              memory: 24Gi
-              ephemeral-storage: 4Gi
+              cpu: "2"
+              memory: 8Gi
+              ephemeral-storage: 1Gi
               nvidia.com/gpu: "1"
             limits:
               cpu: "4"
