@@ -6,11 +6,7 @@ metadata:
   labels:
     jobgroup: hls4ml-paper-baseline-multiplicity-eval
 spec:
-  completions: 3
-  parallelism: 3
-  completionMode: Indexed
   backoffLimit: 0
-  backoffLimitPerIndex: 0
   template:
     metadata:
       labels:
@@ -58,12 +54,6 @@ spec:
             - |
               set -euo pipefail
 
-              MODELS=(
-                salt
-                linformer
-                pointnet
-              )
-              MODEL="${MODELS[$JOB_COMPLETION_INDEX]}"
               REPO_DIR="/tmp/sal_t_hls4ml_paper_baseline_eval"
 
               git clone --branch "$REPO_REF" --single-branch \
@@ -74,11 +64,13 @@ spec:
               test -f "$DATA_DIR/y_val_robust_150const_ptetaphi.npy"
               python3 -m py_compile scripts/evaluate_hls4ml_multiplicity.py
 
-              echo "Starting model=$MODEL indexed_completion=$JOB_COMPLETION_INDEX"
-              python3 scripts/evaluate_hls4ml_multiplicity.py \
-                --model "$MODEL" \
-                --data-dir "$DATA_DIR" \
-                --chunk-size "$CHUNK_SIZE"
+              for MODEL in salt linformer pointnet; do
+                echo "Starting model=$MODEL"
+                python3 scripts/evaluate_hls4ml_multiplicity.py \
+                  --model "$MODEL" \
+                  --data-dir "$DATA_DIR" \
+                  --chunk-size "$CHUNK_SIZE"
+              done
 
               echo "Evaluation finished; sleeping for log retrieval"
               sleep "$POST_RUN_SLEEP_SECONDS"
