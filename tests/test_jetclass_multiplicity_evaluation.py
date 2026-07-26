@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
 
 from scripts.evaluate_jetclass_multiplicity import (
     BinnedMetrics,
@@ -61,10 +62,65 @@ def test_background_rejection_is_inverse_fpr_at_80_percent_efficiency():
     metrics.update(counts, truth, predictions)
     result = metrics.result()["overall"][0]
 
-    # Four of five signal events pass at 80% efficiency, along with one of
-    # five background events: rejection = 1 / 0.2 = 5.
-    assert result["background_rejection_at_0p8"]["label_Hbb"] == 5.0
-    assert result["avg_background_rejection_at_0p8"] == 5.0
+    # This deliberately contains a horizontal ROC segment at TPR=0.8.
+    # np.interp matches the project's existing behavior and selects its
+    # right endpoint, where FPR=1 and rejection=1.
+    assert result["background_rejection_at_0p8"]["label_Hbb"] == 1.0
+    assert result["avg_background_rejection_at_0p8"] == 1.0
+
+
+def test_streaming_metrics_match_project_sklearn_definitions():
+    score_bins = 128
+    rng = np.random.default_rng(1234)
+    truth_index = np.tile(np.arange(10), 100)
+    truth = np.eye(10, dtype=np.float32)[truth_index]
+    predictions = (
+        rng.integers(0, score_bins, size=(len(truth), 10)) + 0.25
+    ) / score_bins
+    counts = np.full(len(truth), 30)
+
+    metrics = BinnedMetrics(score_bins=score_bins)
+    metrics.update(counts, truth, predictions)
+    result = metrics.result()["overall"][0]
+
+    expected_accuracy = accuracy_score(
+        np.argmax(truth, axis=1), np.argmax(predictions, axis=1)
+    )
+    expected_auc = roc_auc_score(
+        truth, predictions, average="macro", multi_class="ovo"
+    )
+    expected_rejections = {}
+    for class_index, label in enumerate(
+        [
+            "label_QCD",
+            "label_Hbb",
+            "label_Hcc",
+            "label_Hgg",
+            "label_H4q",
+            "label_Hqql",
+            "label_Zqq",
+            "label_Wqq",
+            "label_Tbqq",
+            "label_Tbl",
+        ][1:],
+        start=1,
+    ):
+        fpr, tpr, _ = roc_curve(truth[:, class_index], predictions[:, class_index])
+        fpr_at_efficiency = np.interp(0.8, tpr, fpr)
+        expected_rejections[label] = (
+            1.0 / fpr_at_efficiency if fpr_at_efficiency > 0 else math.nan
+        )
+
+    assert result["accuracy"] == expected_accuracy
+    assert np.isclose(result["roc_auc"], expected_auc)
+    for label, expected in expected_rejections.items():
+        assert np.isclose(
+            result["background_rejection_at_0p8"][label], expected
+        )
+    assert np.isclose(
+        result["avg_background_rejection_at_0p8"],
+        np.mean(list(expected_rejections.values())),
+    )
 
 
 def test_trial_aggregation_uses_sample_standard_deviation():

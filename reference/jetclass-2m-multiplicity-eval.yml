@@ -6,8 +6,8 @@ metadata:
   labels:
     jobgroup: jetclass-multiplicity-eval
 spec:
-  completions: 8
-  parallelism: 8
+  completions: 7
+  parallelism: 7
   completionMode: Indexed
   backoffLimitPerIndex: 10
   template:
@@ -65,7 +65,6 @@ spec:
                 transformer
                 salt
                 linformer
-                part_small
                 pointnet
                 pointtransformer_serialized
               )

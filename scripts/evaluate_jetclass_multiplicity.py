@@ -590,7 +590,7 @@ class BinnedMetrics:
         negative: np.ndarray,
         signal_efficiency: float = 0.8,
     ) -> float:
-        """Approximate 1/FPR at the ROC point nearest the requested TPR."""
+        """Approximate interpolated 1/FPR at the requested TPR."""
         n_positive = int(positive.sum())
         n_negative = int(negative.sum())
         if n_positive == 0 or n_negative == 0:
@@ -598,10 +598,15 @@ class BinnedMetrics:
 
         true_positives = np.cumsum(positive[::-1], dtype=np.int64)
         false_positives = np.cumsum(negative[::-1], dtype=np.int64)
-        tpr = np.concatenate(([0.0], true_positives / n_positive))
-        fpr = np.concatenate(([0.0], false_positives / n_negative))
-        index = int(np.argmin(np.abs(tpr - signal_efficiency)))
-        return float(1.0 / fpr[index]) if fpr[index] > 0 else math.inf
+        occupied = (positive[::-1] + negative[::-1]) > 0
+        tpr = np.concatenate(([0.0], true_positives[occupied] / n_positive))
+        fpr = np.concatenate(([0.0], false_positives[occupied] / n_negative))
+        fpr_at_efficiency = float(np.interp(signal_efficiency, tpr, fpr))
+        return (
+            float(1.0 / fpr_at_efficiency)
+            if fpr_at_efficiency > 0
+            else math.nan
+        )
 
     def result(self) -> dict:
         result = {}
@@ -852,8 +857,8 @@ def main() -> None:
         "particle_count_definition": "count(abs(pt) > 1e-6) before sorting",
         "auc_method": "project-standard ROC AUC from uniformly quantized score histograms",
         "background_rejection_method": (
-            "mean 1/FPR at the ROC point nearest TPR=0.8 over all nine "
-            "non-QCD JetClass signal labels"
+            "mean interpolated 1/FPR at TPR=0.8 over all nine non-QCD "
+            "JetClass signal labels, matching the JetClass summarizer"
         ),
         "score_bins": args.score_bins,
         "requested_checkpoints": [str(path) for path in checkpoints],
