@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Evaluate JetClass checkpoints in bins of the number of real particles.
 
-The evaluator is intentionally log-only.  Predictions are reduced online into
+The evaluator is intentionally log-only. Predictions are reduced online into
 accuracy/confusion-matrix counts and score histograms, so no result artifacts are
-written to the shared PVC.  The score histograms provide a high-resolution
-approximation to one-vs-rest AUC without retaining the 20M-event prediction set.
+written to the shared PVC. The score histograms provide high-resolution
+approximations to the project's standard ROC AUC and background rejection at
+80% signal efficiency without retaining the 20M-event prediction set.
 """
 
 from __future__ import annotations
@@ -583,6 +584,25 @@ class BinnedMetrics:
         )
         return float(wins / (n_positive * n_negative))
 
+    @staticmethod
+    def _histogram_background_rejection(
+        positive: np.ndarray,
+        negative: np.ndarray,
+        signal_efficiency: float = 0.8,
+    ) -> float:
+        """Approximate 1/FPR at the ROC point nearest the requested TPR."""
+        n_positive = int(positive.sum())
+        n_negative = int(negative.sum())
+        if n_positive == 0 or n_negative == 0:
+            return math.nan
+
+        true_positives = np.cumsum(positive[::-1], dtype=np.int64)
+        false_positives = np.cumsum(negative[::-1], dtype=np.int64)
+        tpr = np.concatenate(([0.0], true_positives / n_positive))
+        fpr = np.concatenate(([0.0], false_positives / n_negative))
+        index = int(np.argmin(np.abs(tpr - signal_efficiency)))
+        return float(1.0 / fpr[index]) if fpr[index] > 0 else math.inf
+
     def result(self) -> dict:
         result = {}
         for scheme, bins in BIN_SCHEMES.items():
@@ -612,6 +632,18 @@ class BinnedMetrics:
                     for class_index in range(len(LABELS))
                 ]
                 valid_aucs = [value for value in aucs if math.isfinite(value)]
+                background_rejections = [
+                    self._histogram_background_rejection(
+                        positive_scores[class_index],
+                        negative_scores[class_index],
+                    )
+                    for class_index in range(1, len(LABELS))
+                ]
+                defined_rejections = [
+                    value
+                    for value in background_rejections
+                    if math.isfinite(value)
+                ]
                 rows.append(
                     {
                         "bin": label,
@@ -625,12 +657,23 @@ class BinnedMetrics:
                             if events
                             else math.nan
                         ),
-                        "macro_ovr_auc": (
+                        "roc_auc": (
                             float(np.mean(valid_aucs)) if valid_aucs else math.nan
                         ),
-                        "per_class_ovr_auc": {
+                        "per_class_auc": {
                             name: value for name, value in zip(LABELS, aucs)
                         },
+                        "background_rejection_at_0p8": {
+                            name: value
+                            for name, value in zip(
+                                LABELS[1:], background_rejections
+                            )
+                        },
+                        "avg_background_rejection_at_0p8": (
+                            float(np.mean(defined_rejections))
+                            if defined_rejections
+                            else math.nan
+                        ),
                         "class_counts": {
                             name: int(value)
                             for name, value in zip(LABELS, class_counts)
@@ -663,11 +706,20 @@ def aggregate_trials(trial_results: list[dict]) -> dict:
                 for trial in range(len(trial_results))
             ]
             aucs = [
-                trial_results[trial][scheme][bin_index]["macro_ovr_auc"]
+                trial_results[trial][scheme][bin_index]["roc_auc"]
+                for trial in range(len(trial_results))
+            ]
+            background_rejections = [
+                trial_results[trial][scheme][bin_index][
+                    "avg_background_rejection_at_0p8"
+                ]
                 for trial in range(len(trial_results))
             ]
             accuracy_mean, accuracy_std = mean_and_std(accuracies)
             auc_mean, auc_std = mean_and_std(aucs)
+            rejection_mean, rejection_std = mean_and_std(
+                background_rejections
+            )
             rows.append(
                 {
                     "bin": label,
@@ -682,8 +734,10 @@ def aggregate_trials(trial_results: list[dict]) -> dict:
                     ],
                     "accuracy_mean": accuracy_mean,
                     "accuracy_std": accuracy_std,
-                    "macro_ovr_auc_mean": auc_mean,
-                    "macro_ovr_auc_std": auc_std,
+                    "roc_auc_mean": auc_mean,
+                    "roc_auc_std": auc_std,
+                    "avg_background_rejection_at_0p8_mean": rejection_mean,
+                    "avg_background_rejection_at_0p8_std": rejection_std,
                 }
             )
         aggregate[scheme] = rows
@@ -698,14 +752,18 @@ def print_markdown(model_name: str, aggregate: dict) -> None:
 
     for scheme in ("fine", "coarse", "overall"):
         print(f"\n===== {model_name}: {scheme} multiplicity bins =====")
-        print("| bin | N jets | non-finite predictions by trial | accuracy | macro OvR AUC |")
-        print("|---:|---:|---:|---:|---:|")
+        print(
+            "| bin | N jets | non-finite predictions by trial | "
+            "accuracy | ROC AUC | Avg bg rejection@0.8 |"
+        )
+        print("|---:|---:|---:|---:|---:|---:|")
         for row in aggregate[scheme]:
             print(
                 f"| {row['bin']} | {row['n_events']} | "
                 f"{','.join(str(value) for value in row['n_nonfinite_predictions'])} | "
                 f"{format_metric(row['accuracy_mean'], row['accuracy_std'])} | "
-                f"{format_metric(row['macro_ovr_auc_mean'], row['macro_ovr_auc_std'])} |"
+                f"{format_metric(row['roc_auc_mean'], row['roc_auc_std'])} | "
+                f"{format_metric(row['avg_background_rejection_at_0p8_mean'], row['avg_background_rejection_at_0p8_std'])} |"
             )
 
 
@@ -787,12 +845,16 @@ def main() -> None:
     aggregate = aggregate_trials(trial_results)
     print_markdown(spec.name, aggregate)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "dataset": "jetclass_2m_train_20m_test",
         "model": spec.name,
         "sort_by": "kt",
         "particle_count_definition": "count(abs(pt) > 1e-6) before sorting",
-        "auc_method": "macro one-vs-rest from uniformly quantized score histograms",
+        "auc_method": "project-standard ROC AUC from uniformly quantized score histograms",
+        "background_rejection_method": (
+            "mean 1/FPR at the ROC point nearest TPR=0.8 over all nine "
+            "non-QCD JetClass signal labels"
+        ),
         "score_bins": args.score_bins,
         "requested_checkpoints": [str(path) for path in checkpoints],
         "loaded_checkpoints": [

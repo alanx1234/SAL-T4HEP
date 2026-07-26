@@ -12,7 +12,7 @@ from scripts.evaluate_jetclass_multiplicity import (
 )
 
 
-def test_binned_metrics_counts_accuracy_and_auc():
+def test_binned_metrics_counts_accuracy_auc_and_background_rejection():
     metrics = BinnedMetrics(score_bins=100)
     counts = np.array([10, 30, 55, 150])
     truth_index = np.array([0, 1, 0, 1])
@@ -41,7 +41,30 @@ def test_binned_metrics_counts_accuracy_and_auc():
     assert result["coarse"][0]["accuracy"] == 0.5
     assert result["overall"][0]["accuracy"] == 0.75
     assert result["overall"][0]["confusion_matrix"][1][0] == 1
-    assert math.isfinite(result["overall"][0]["macro_ovr_auc"])
+    assert math.isfinite(result["overall"][0]["roc_auc"])
+    assert "label_QCD" not in result["overall"][0][
+        "background_rejection_at_0p8"
+    ]
+
+
+def test_background_rejection_is_inverse_fpr_at_80_percent_efficiency():
+    metrics = BinnedMetrics(score_bins=100)
+    counts = np.full(10, 30)
+    truth_index = np.array([1] * 5 + [0] * 5)
+    truth = np.eye(10, dtype=np.float32)[truth_index]
+    predictions = np.zeros((10, 10), dtype=np.float32)
+    predictions[:, 0] = 0.01
+    predictions[:, 1] = np.array(
+        [0.95, 0.90, 0.85, 0.80, 0.10, 0.99, 0.70, 0.60, 0.50, 0.40]
+    )
+
+    metrics.update(counts, truth, predictions)
+    result = metrics.result()["overall"][0]
+
+    # Four of five signal events pass at 80% efficiency, along with one of
+    # five background events: rejection = 1 / 0.2 = 5.
+    assert result["background_rejection_at_0p8"]["label_Hbb"] == 5.0
+    assert result["avg_background_rejection_at_0p8"] == 5.0
 
 
 def test_trial_aggregation_uses_sample_standard_deviation():
