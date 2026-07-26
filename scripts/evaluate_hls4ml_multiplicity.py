@@ -415,7 +415,7 @@ def main() -> None:
     else:
         import torch
 
-        if not torch.cuda.is_available():
+        if not torch.cuda.is_available() and not args.load_only:
             raise RuntimeError("CUDA is required for full ParT evaluation")
 
     data_dir = Path(args.data_dir)
@@ -450,7 +450,9 @@ def main() -> None:
         else:
             import torch
 
-            device = torch.device("cuda")
+            device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
             model = make_part_model().to(device)
             try:
                 state = torch.load(
@@ -529,7 +531,8 @@ def main() -> None:
         else:
             import torch
 
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     if args.load_only:
         print(f"LOAD_ONLY_OK model={spec.name}", flush=True)
