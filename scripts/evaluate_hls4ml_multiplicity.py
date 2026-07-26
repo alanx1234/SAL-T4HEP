@@ -51,9 +51,9 @@ MODEL_SPECS = {
         "phatjet",
         "tensorflow",
         (
-            "/j-jepa-vol/1p3mFLOPs_runs/ptv3/trial-0/150/kt/trial-5/best.weights.h5",
-            "/j-jepa-vol/1p3mFLOPs_runs/ptv3/trial-1/150/kt/trial-6/best.weights.h5",
-            "/j-jepa-vol/1p3mFLOPs_runs/ptv3/trial-2/150/kt/trial-5/best.weights.h5",
+            "/j-jepa-vol/ptv3_sweeps/sweep_v1/pool0_aggmean_cpe1_ffngelu_tokmean_proj1_gate0/trial-0/150/kt/trial-0/model.weights.h5",
+            "/j-jepa-vol/ptv3_sweeps/sweep_v1/pool0_aggmean_cpe1_ffngelu_tokmean_proj1_gate0/trial-1/150/kt/trial-0/model.weights.h5",
+            "/j-jepa-vol/ptv3_sweeps/sweep_v1/pool0_aggmean_cpe1_ffngelu_tokmean_proj1_gate0/trial-2/150/kt/trial-0/model.weights.h5",
         ),
         2048,
     ),
@@ -127,27 +127,35 @@ def resolve_checkpoints(spec: ModelSpec) -> list[Path]:
 
 def make_tensorflow_model(model_name: str):
     if model_name == "phatjet":
-        from models.PointTransformer_serialized import (
-            build_ptv3_serialized_jet_classifier,
-        )
+        from models.PointTransformerV3TF import build_ptv3_jet_classifier
 
-        return build_ptv3_serialized_jet_classifier(
+        model = build_ptv3_jet_classifier(
             num_particles=150,
             output_dim=5,
-            enc_dims=[16, 32],
-            enc_layers=[1, 1],
-            enc_heads=[4, 4],
-            enc_patch_sizes=[25, 25],
-            enc_strides=[2],
+            enc_dims=[12, 24, 32],
+            enc_layers=[1, 1, 1],
+            enc_heads=[4, 4, 4],
+            enc_patch_sizes=[2, 2, 2],
+            enc_strides=[2, 2],
             cpe_k=8,
             grid_size=0.2,
             use_rpe=False,
-            use_pool=True,
+            use_cpe=True,
+            use_pool=False,
             dropout=0.0,
-            aggregation="max",
-            serialize_by="kt",
-            assume_serialized_input=False,
+            aggregation="mean",
+            ffn_activation="gelu",
+            use_flash_attention=True,
+            use_patch_messages=True,
+            patch_tokenizer_mode="mean",
+            message_proj=True,
+            message_gated=False,
         )
+        if model.count_params() != 6405:
+            raise RuntimeError(
+                f"Unexpected PHAT-JeT parameter count: {model.count_params()}"
+            )
+        return model
     if model_name in {"salt", "linformer"}:
         from models.Linformer import build_linformer_transformer_classifier
 
@@ -225,7 +233,7 @@ def make_part_model():
 def _load_tensorflow_checkpoint(model_name: str, checkpoint: Path, trial: int):
     attempts = [checkpoint]
     final_checkpoint = checkpoint.with_name("model.weights.h5")
-    if final_checkpoint.is_file():
+    if final_checkpoint != checkpoint and final_checkpoint.is_file():
         attempts.append(final_checkpoint)
     errors = []
     for candidate in attempts:
