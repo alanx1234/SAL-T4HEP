@@ -50,6 +50,10 @@ spec:
               value: "32768"
             - name: POST_RUN_SLEEP_SECONDS
               value: "86400"
+            - name: PHAT_MODEL_MODULE
+              value: "models.PointTransformerV3TF_checkpoint_compat"
+            - name: PHAT_MODEL_SOURCE_COMMIT
+              value: "ed0f146600a1fe8d1f14eb93225ae5a17adafb55"
           args:
             - |
               set -euo pipefail
@@ -59,6 +63,11 @@ spec:
               git clone --branch "$REPO_REF" --single-branch \
                 https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
               cd "$REPO_DIR"
+
+              git show \
+                "$PHAT_MODEL_SOURCE_COMMIT:models/PointTransformerV3TF.py" \
+                > models/PointTransformerV3TF_checkpoint_compat.py
+              echo "PHAT compatibility model source: $PHAT_MODEL_SOURCE_COMMIT"
 
               test -f "$DATA_DIR/x_val_robust_150const_ptetaphi.npy"
               test -f "$DATA_DIR/y_val_robust_150const_ptetaphi.npy"

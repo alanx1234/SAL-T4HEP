@@ -10,8 +10,10 @@ every multiplicity bin.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -127,16 +129,21 @@ def resolve_checkpoints(spec: ModelSpec) -> list[Path]:
 
 def make_tensorflow_model(model_name: str):
     if model_name == "phatjet":
-        from models.PointTransformerV3TF import build_ptv3_jet_classifier
+        module_name = os.environ.get(
+            "PHAT_MODEL_MODULE", "models.PointTransformerV3TF"
+        )
+        build_ptv3_jet_classifier = importlib.import_module(
+            module_name
+        ).build_ptv3_jet_classifier
 
         model = build_ptv3_jet_classifier(
             num_particles=150,
             output_dim=5,
-            enc_dims=[12, 24, 32],
-            enc_layers=[1, 1, 1],
-            enc_heads=[4, 4, 4],
-            enc_patch_sizes=[2, 2, 2],
-            enc_strides=[2, 2],
+            enc_dims=[16],
+            enc_layers=[1],
+            enc_heads=[4],
+            enc_patch_sizes=[25],
+            enc_strides=[2],
             cpe_k=8,
             grid_size=0.2,
             use_rpe=False,
@@ -412,6 +419,14 @@ def main() -> None:
     batch_size = args.batch_size or spec.batch_size
     checkpoints = resolve_checkpoints(spec)
     print(f"model={spec.name} framework={spec.framework}", flush=True)
+    if spec.name == "phatjet":
+        print(
+            "phat_model_module="
+            + os.environ.get(
+                "PHAT_MODEL_MODULE", "models.PointTransformerV3TF"
+            ),
+            flush=True,
+        )
     for trial, checkpoint in enumerate(checkpoints):
         print(f"trial={trial} checkpoint={checkpoint}", flush=True)
 
