@@ -6,7 +6,7 @@ metadata:
   labels:
     jobgroup: hls4ml-phat-multiplicity-eval
 spec:
-  backoffLimit: 2
+  backoffLimit: 0
   template:
     metadata:
       labels:
