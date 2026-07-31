@@ -42,26 +42,44 @@ def unwrap_phi_per_jet(phi: tf.Tensor, mask: tf.Tensor | None = None) -> tf.Tens
 
 class GeometricCPE(layers.Layer):
     """
-    Convolutional Position Encoding that respects jet geometry.
+    Geometric Message Passing (GMP): convolutional position encoding over a coarse
+    detector/space grid.
 
-    Fixes the phi seam issue by centering phi per-jet (circular mean) before quantization,
-    so jets straddling the -x axis (phi ~ +/- pi) don't explode the grid width.
+    For jets (coord_dim=2) this respects jet geometry: it fixes the phi seam issue by
+    centering phi per-jet (circular mean) before quantization, so jets straddling the
+    -x axis (phi ~ +/- pi) don't explode the grid width.
+
+    For generic point clouds (coord_dim=3, e.g. ModelNet) the same construction is applied
+    over (x, y, z) with a depthwise Conv3D and no angular wrapping.
 
     coord_mode:
-      - "raw": quantize on (eta, centered_phi)
-      - "pt" : quantize on (pt*eta, pt*centered_phi)
+      - "raw": quantize on the raw coordinates
+      - "pt" : quantize on weight-scaled coordinates (requires a weight channel)
+
+    wrap_last_coord:
+      - True  (jets): treat the final coordinate as periodic and center it per-cloud
+      - False (generic): no wrapping
     """
-    def __init__(self, channels, kernel_size=3, grid_size=0.05, coord_mode="raw", **kwargs):
+    def __init__(self, channels, kernel_size=3, grid_size=0.05, coord_mode="raw",
+                 coord_dim=2, wrap_last_coord=None, max_grid_cells=1 << 20, **kwargs):
         super().__init__(**kwargs)
         if coord_mode not in ("raw", "pt"):
             raise ValueError('coord_mode must be "raw" or "pt"')
+        if coord_dim not in (2, 3):
+            raise ValueError("coord_dim must be 2 or 3")
         self.channels = channels
         self.kernel_size = kernel_size
         self.grid_size = grid_size
         self.coord_mode = coord_mode
+        self.coord_dim = coord_dim
+        # Angular wrapping is a jet-specific correction; default it on only for 2D.
+        self.wrap_last_coord = (coord_dim == 2) if wrap_last_coord is None else wrap_last_coord
+        # Guard against a too-fine grid_size blowing up the scatter buffer.
+        self.max_grid_cells = max_grid_cells
 
         # Depthwise conv via groups=channels (Keras supports this)
-        self.conv2d = layers.Conv2D(
+        conv_cls = layers.Conv2D if coord_dim == 2 else layers.Conv3D
+        self.conv = conv_cls(
             channels,
             kernel_size=kernel_size,
             padding="same",
@@ -71,86 +89,91 @@ class GeometricCPE(layers.Layer):
         self.pointwise = layers.Dense(channels)
         self.norm = layers.LayerNormalization(epsilon=1e-6)
 
-    def call(self, x, pt, eta, phi, mask=None):
+    def call(self, x, weight, coords, mask=None):
         """
         Args:
-            x:   Features [B, N, C]
-            pt:  Particle pt [B, N]
-            eta: Particle eta [B, N]
-            phi: Particle phi [B, N] (radians, possibly straddling +/-pi)
-            mask: optional [B, N] bool where True means real (not padded)
+            x:      Features [B, N, C]
+            weight: Per-point scalar weight [B, N] (pt for jets); may be None
+            coords: Coordinates [B, N, coord_dim]
+            mask:   optional [B, N] bool where True means real (not padded)
         """
         B = tf.shape(x)[0]
         N = tf.shape(x)[1]
         C = self.channels
+        D = self.coord_dim
         residual = x
 
-        # seam-safe phi per jet
-        phi_centered = unwrap_phi_per_jet(phi, mask=mask)
+        # Split into per-axis coordinates, seam-correcting the last one for jets.
+        axes = [coords[..., i] for i in range(D)]
+        if self.wrap_last_coord:
+            axes[-1] = unwrap_phi_per_jet(axes[-1], mask=mask)
 
         if self.coord_mode == "pt":
+            if weight is None:
+                raise ValueError('coord_mode="pt" requires a weight channel')
             clip_max = 10.0
-            pt_eff = tf.abs(pt)
-            pt_eff = clip_max * pt_eff / (pt_eff + clip_max)
-            c1 = pt_eff * eta
-            c2 = pt_eff * phi_centered
-        else:
-            c1 = eta
-            c2 = phi_centered
+            w_eff = tf.abs(weight)
+            w_eff = clip_max * w_eff / (w_eff + clip_max)
+            axes = [w_eff * a for a in axes]
 
-        # Quantize to grid per batch element (min-shifted), but compute mins over real particles only
-        if mask is not None:
-            inf = tf.cast(1e9, c1.dtype)
-            c1_for_min = tf.where(mask, c1, inf)
-            c2_for_min = tf.where(mask, c2, inf)
-            c1_min = tf.reduce_min(c1_for_min, axis=1, keepdims=True)
-            c2_min = tf.reduce_min(c2_for_min, axis=1, keepdims=True)
+        # Quantize to grid per batch element (min-shifted), but compute mins over real points only
+        shifted = []
+        for a in axes:
+            if mask is not None:
+                inf = tf.cast(1e9, a.dtype)
+                a_for_min = tf.where(mask, a, inf)
+                a_min = tf.reduce_min(a_for_min, axis=1, keepdims=True)
+                # if a cloud is fully padded, mins become inf -> reset to 0
+                a_min = tf.where(tf.math.is_finite(a_min), a_min, tf.zeros_like(a_min))
+                shifted.append(tf.where(mask, a - a_min, tf.zeros_like(a)))
+            else:
+                a_min = tf.reduce_min(a, axis=1, keepdims=True)
+                shifted.append(a - a_min)
 
-            # if a jet is fully padded, mins become inf -> reset to 0
-            c1_min = tf.where(tf.math.is_finite(c1_min), c1_min, tf.zeros_like(c1_min))
-            c2_min = tf.where(tf.math.is_finite(c2_min), c2_min, tf.zeros_like(c2_min))
-
-            c1_shift = tf.where(mask, c1 - c1_min, tf.zeros_like(c1))
-            c2_shift = tf.where(mask, c2 - c2_min, tf.zeros_like(c2))
-        else:
-            c1_min = tf.reduce_min(c1, axis=1, keepdims=True)
-            c2_min = tf.reduce_min(c2, axis=1, keepdims=True)
-            c1_shift = c1 - c1_min
-            c2_shift = c2 - c2_min
-
-        grid_eta = tf.cast(tf.floor(c1_shift / self.grid_size), tf.int32)
-        grid_phi = tf.cast(tf.floor(c2_shift / self.grid_size), tf.int32)
+        grid_idx = [tf.cast(tf.floor(s / self.grid_size), tf.int32) for s in shifted]
 
         if mask is not None:
-            # Force padded tokens into (0,0) and zero their features before scatter
-            grid_eta = tf.where(mask, grid_eta, tf.zeros_like(grid_eta))
-            grid_phi = tf.where(mask, grid_phi, tf.zeros_like(grid_phi))
+            # Force padded tokens into the origin cell and zero their features before scatter
+            grid_idx = [tf.where(mask, g, tf.zeros_like(g)) for g in grid_idx]
             x_scatter = tf.where(mask[..., None], x, tf.zeros_like(x))
         else:
             x_scatter = x
 
         # Global (over batch) grid dims (safe, may over-allocate slightly)
-        H = tf.reduce_max(grid_eta) + 1
-        W = tf.reduce_max(grid_phi) + 1
-        H = tf.maximum(H, 1)
-        W = tf.maximum(W, 1)
+        dims = [tf.maximum(tf.reduce_max(g) + 1, 1) for g in grid_idx]
+
+        # Cap total cells so a mis-set grid_size cannot allocate an enormous buffer.
+        # Scaling every axis by the same factor keeps the grid isotropic.
+        if self.max_grid_cells is not None:
+            total = dims[0]
+            for d in dims[1:]:
+                total = total * d
+            cap = tf.constant(self.max_grid_cells, dtype=total.dtype)
+            shrink = tf.maximum(
+                tf.cast(tf.math.ceil(tf.pow(tf.cast(total, tf.float32) / tf.cast(cap, tf.float32),
+                                            1.0 / float(D))), tf.int32),
+                1,
+            )
+            shrink = tf.where(total > cap, shrink, tf.ones_like(shrink))
+            grid_idx = [g // shrink for g in grid_idx]
+            dims = [tf.maximum(tf.reduce_max(g) + 1, 1) for g in grid_idx]
 
         # Clamp indices
-        grid_eta = tf.clip_by_value(grid_eta, 0, H - 1)
-        grid_phi = tf.clip_by_value(grid_phi, 0, W - 1)
+        grid_idx = [tf.clip_by_value(g, 0, d - 1) for g, d in zip(grid_idx, dims)]
 
         batch_idx = tf.range(B)[:, None]
         batch_idx = tf.tile(batch_idx, [1, N])
 
-        indices = tf.stack([batch_idx, grid_eta, grid_phi], axis=-1)  # [B, N, 3]
-        flat_indices = tf.reshape(indices, [-1, 3])
+        indices = tf.stack([batch_idx] + grid_idx, axis=-1)  # [B, N, 1+D]
+        flat_indices = tf.reshape(indices, [-1, D + 1])
         flat_features = tf.reshape(x_scatter, [-1, C])
 
-        grid = tf.scatter_nd(flat_indices, flat_features, [B, H, W, C])
-        grid = self.conv2d(grid)
+        grid_shape = tf.stack([B] + dims + [tf.constant(C, dtype=tf.int32)])
+        grid = tf.scatter_nd(flat_indices, flat_features, grid_shape)
+        grid = self.conv(grid)
 
-        # Gather back to particles
-        out = tf.gather_nd(grid, tf.reshape(flat_indices, [B, N, 3]))
+        # Gather back to points
+        out = tf.gather_nd(grid, tf.reshape(flat_indices, [B, N, D + 1]))
 
         out = self.pointwise(out)
         out = self.norm(out)
@@ -161,15 +184,20 @@ class QuantizedRPE(layers.Layer):
     """
     RPE using quantized relative positions with learnable table.
     """
-    def __init__(self, num_heads, quantization_bins=32, **kwargs):
+    def __init__(self, num_heads, quantization_bins=32, coord_dim=2, wrap_last_coord=None, **kwargs):
         super().__init__(**kwargs)
+        if coord_dim not in (2, 3):
+            raise ValueError("coord_dim must be 2 or 3")
         self.num_heads = num_heads
         self.bins = quantization_bins
+        self.coord_dim = coord_dim
+        # The last axis is periodic (phi) for jets only.
+        self.wrap_last_coord = (coord_dim == 2) if wrap_last_coord is None else wrap_last_coord
 
-        # table indices: [0..bins-1] for eta, [bins..2*bins-1] for phi
+        # table indices: axis i occupies [i*bins .. (i+1)*bins-1]
         self.rpe_table = self.add_weight(
             name="rpe_table",
-            shape=[2 * quantization_bins, num_heads],
+            shape=[coord_dim * quantization_bins, num_heads],
             initializer=tf.keras.initializers.TruncatedNormal(stddev=0.02),
             trainable=True
         )
@@ -177,38 +205,32 @@ class QuantizedRPE(layers.Layer):
     def call(self, coords):
         """
         Args:
-            coords: [B, T, 2] where coords[...,0]=eta, coords[...,1]=phi
+            coords: [B, T, coord_dim]. For jets coords[...,0]=eta, coords[...,1]=phi.
         Returns:
             bias: [B, H, T, T]
         """
-        eta = coords[..., 0]  # [B, T]
-        phi = coords[..., 1]  # [B, T]
+        pi = tf.constant(math.pi, dtype=coords.dtype)
+        half = self.bins // 2
+        bias = None
 
-        rel_eta = eta[:, :, None] - eta[:, None, :]  # [B, T, T]
-        rel_phi = phi[:, :, None] - phi[:, None, :]  # [B, T, T]
+        for axis in range(self.coord_dim):
+            c = coords[..., axis]  # [B, T]
+            rel = c[:, :, None] - c[:, None, :]  # [B, T, T]
 
-        # phi periodicity
-        pi = tf.constant(math.pi, dtype=phi.dtype)
-        rel_phi = tf.math.floormod(rel_phi + pi, 2 * pi) - pi
+            is_periodic = self.wrap_last_coord and axis == self.coord_dim - 1
+            if is_periodic:
+                rel = tf.math.floormod(rel + pi, 2 * pi) - pi
+                rel_range = pi
+            else:
+                rel_range = tf.maximum(tf.reduce_max(tf.abs(rel)), tf.cast(1e-6, coords.dtype))
 
-        # quantize
-        eta_range = tf.reduce_max(tf.abs(rel_eta))
-        eta_range = tf.maximum(eta_range, tf.cast(1e-6, eta.dtype))
-        phi_range = tf.constant(math.pi, dtype=phi.dtype)
+            bins = tf.cast(rel / rel_range * half, tf.int32)
+            bins = tf.clip_by_value(bins, -half, half - 1)
+            idx = bins + half + axis * self.bins
 
-        eta_bins = tf.cast(rel_eta / eta_range * (self.bins // 2), tf.int32)
-        phi_bins = tf.cast(rel_phi / phi_range * (self.bins // 2), tf.int32)
+            axis_bias = tf.gather(self.rpe_table, idx)  # [B, T, T, H]
+            bias = axis_bias if bias is None else bias + axis_bias
 
-        eta_bins = tf.clip_by_value(eta_bins, -self.bins // 2, self.bins // 2 - 1)
-        phi_bins = tf.clip_by_value(phi_bins, -self.bins // 2, self.bins // 2 - 1)
-
-        eta_idx = eta_bins + self.bins // 2
-        phi_idx = phi_bins + self.bins // 2 + self.bins
-
-        eta_bias = tf.gather(self.rpe_table, eta_idx)  # [B, T, T, H]
-        phi_bias = tf.gather(self.rpe_table, phi_idx)  # [B, T, T, H]
-
-        bias = eta_bias + phi_bias
         bias = tf.transpose(bias, [0, 3, 1, 2])  # [B, H, T, T]
         return bias
 
@@ -219,13 +241,14 @@ class QuantizedRPE(layers.Layer):
 
 class PatchedAttention(layers.Layer):
     """Local attention with patching and optional Flash Attention support."""
-    def __init__(self, d_model, num_heads, patch_size, dropout=0.0, use_rpe=True, use_flash_attention=False, **kwargs):
+    def __init__(self, d_model, num_heads, patch_size, dropout=0.0, use_rpe=True, use_flash_attention=False, coord_dim=2, **kwargs):
         super().__init__(**kwargs)
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_head = d_model // num_heads
         self.patch_size = patch_size
         self.use_rpe = use_rpe
+        self.coord_dim = coord_dim
         self.use_flash_attention = use_flash_attention and FLASH_ATTENTION_AVAILABLE
 
         if self.use_flash_attention:
@@ -237,7 +260,7 @@ class PatchedAttention(layers.Layer):
                 dropout=dropout,
                 use_bias=True
             )
-            self.rpe = QuantizedRPE(num_heads) if use_rpe else None
+            self.rpe = QuantizedRPE(num_heads, coord_dim=coord_dim) if use_rpe else None
         else:
             # Use custom implementation
             self.wq = layers.Dense(d_model, use_bias=True)
@@ -245,7 +268,7 @@ class PatchedAttention(layers.Layer):
             self.wv = layers.Dense(d_model, use_bias=True)
             self.wo = layers.Dense(d_model, use_bias=True)
             self.dropout = layers.Dropout(dropout)
-            self.rpe = QuantizedRPE(num_heads) if use_rpe else None
+            self.rpe = QuantizedRPE(num_heads, coord_dim=coord_dim) if use_rpe else None
     
     def _split_heads(self, x, num_heads):
         b, t, d = tf.unstack(tf.shape(x)[:3])
@@ -273,8 +296,9 @@ class PatchedAttention(layers.Layer):
         # Reshape to patches
         x_patched = tf.reshape(x, [B, num_patches, P, D])
         x_patched = tf.reshape(x_patched, [B * num_patches, P, D])
-        coords_patched = tf.reshape(coords, [B, num_patches, P, 2])
-        coords_patched = tf.reshape(coords_patched, [B * num_patches, P, 2])
+        coord_dim = coords.shape[-1]
+        coords_patched = tf.reshape(coords, [B, num_patches, P, coord_dim])
+        coords_patched = tf.reshape(coords_patched, [B * num_patches, P, coord_dim])
 
         if self.use_flash_attention:
             # Use Flash Attention via MultiHeadAttention
@@ -398,7 +422,7 @@ class PatchAttention(layers.Layer):
     MHSA over patch tokens only: [B, NP, D] -> [B, NP, D]
     Optional RPE using patch coords (pooled coords): [B, NP, 2]
     """
-    def __init__(self, d_model, num_heads, dropout=0.0, use_rpe=True, **kwargs):
+    def __init__(self, d_model, num_heads, dropout=0.0, use_rpe=True, coord_dim=2, **kwargs):
         super().__init__(**kwargs)
         assert d_model % num_heads == 0
         self.d_model = d_model
@@ -406,7 +430,8 @@ class PatchAttention(layers.Layer):
         self.d_head = d_model // num_heads
         self.dropout = layers.Dropout(dropout)
         self.use_rpe = use_rpe
-        self.rpe = QuantizedRPE(num_heads) if use_rpe else None
+        self.coord_dim = coord_dim
+        self.rpe = QuantizedRPE(num_heads, coord_dim=coord_dim) if use_rpe else None
 
         self.wq = layers.Dense(d_model, use_bias=True)
         self.wk = layers.Dense(d_model, use_bias=True)
@@ -479,6 +504,7 @@ class PatchMessageBroadcast(layers.Layer):
         use_rpe=True,
         message_proj=True,
         gated=False,
+        coord_dim=2,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -492,7 +518,7 @@ class PatchMessageBroadcast(layers.Layer):
         self.gated = gated
 
         self.tokenizer = PatchTokenizer(d_model=d_model, patch_size=patch_size, mode=tokenizer_mode, name="patch_tokenizer")
-        self.patch_attn = PatchAttention(d_model=d_model, num_heads=num_heads, dropout=dropout, use_rpe=use_rpe, name="patch_attention")
+        self.patch_attn = PatchAttention(d_model=d_model, num_heads=num_heads, dropout=dropout, use_rpe=use_rpe, coord_dim=coord_dim, name="patch_attention")
 
         self.proj = layers.Dense(d_model, use_bias=True, name="patch_msg_proj") if message_proj else None
         self.gate_dense = layers.Dense(d_model, use_bias=True, name="patch_msg_gate") if gated else None
@@ -516,10 +542,10 @@ class PatchMessageBroadcast(layers.Layer):
         NP = T_pad // P
 
         x_patch = tf.reshape(x, [B, NP, P, D])
-        c_patch = tf.reshape(coords, [B, NP, P, 2])
+        c_patch = tf.reshape(coords, [B, NP, P, coords.shape[-1]])
 
         # patch coords (for RPE at patch-level)
-        pcoords = tf.reduce_mean(c_patch, axis=2)  # [B, NP, 2]
+        pcoords = tf.reduce_mean(c_patch, axis=2)  # [B, NP, coord_dim]
 
         # patch tokens
         p = self.tokenizer(x_patch)  # [B, NP, D]
@@ -628,7 +654,7 @@ class GeometricPooling(layers.Layer):
             N_out = (N + pad_len) // self.stride
 
         x_grouped = tf.reshape(x_sorted, [B, N_out, self.stride, channels])
-        coords_grouped = tf.reshape(coords_sorted, [B, N_out, self.stride, 2])
+        coords_grouped = tf.reshape(coords_sorted, [B, N_out, self.stride, coords.shape[-1]])
         pt_grouped = tf.reshape(pt_sorted, [B, N_out, self.stride])
         mask_grouped = tf.reshape(mask_sorted, [B, N_out, self.stride])
 
@@ -685,17 +711,21 @@ class PTv3Block(layers.Layer):
         message_proj=True,
         message_gated=False,
         use_flash_attention=False,
+        coord_dim=2,
+        wrap_last_coord=None,
         **kwargs
     ):
         super().__init__(**kwargs)
         assert ffn_activation in ("relu", "gelu")
 
+        self.coord_dim = coord_dim
         self.use_cpe = use_cpe
         if use_cpe:
-            self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size, coord_mode=cpe_coord_mode)
+            self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size, coord_mode=cpe_coord_mode,
+                                    coord_dim=coord_dim, wrap_last_coord=wrap_last_coord)
 
         self.norm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.attn = PatchedAttention(d_model, num_heads, patch_size, dropout=dropout, use_rpe=use_rpe, use_flash_attention=use_flash_attention)
+        self.attn = PatchedAttention(d_model, num_heads, patch_size, dropout=dropout, use_rpe=use_rpe, use_flash_attention=use_flash_attention, coord_dim=coord_dim)
         self.drop1 = layers.Dropout(dropout)
 
         self.use_patch_messages = use_patch_messages
@@ -709,6 +739,7 @@ class PTv3Block(layers.Layer):
                 use_rpe=use_rpe,
                 message_proj=message_proj,
                 gated=message_gated,
+                coord_dim=coord_dim,
                 name="patch_message",
             )
             self.drop_msg = layers.Dropout(dropout)
@@ -723,11 +754,10 @@ class PTv3Block(layers.Layer):
 
     def call(self, inputs, training=False):
         x, coords, pt, mask = inputs
-        eta, phi = coords[..., 0], coords[..., 1]
 
-        # optional CPE (with seam-safe phi)
+        # optional CPE / GMP (seam-safe phi for jets, plain grid for generic clouds)
         if self.use_cpe:
-            x = self.cpe(x, pt, eta, phi, mask=mask)
+            x = self.cpe(x, pt, coords, mask=mask)
 
         # local patched attention
         y = self.attn(self.norm1(x), coords, training=training)
@@ -760,12 +790,14 @@ class JEDIPTv3Block(layers.Layer):
       - cpe_coord_mode: "raw" or "pt"
       - ffn_activation: "relu" or "gelu"
     """
-    def __init__(self, d_model, d_ff, cpe_k=8, grid_size=0.05, cpe_coord_mode="raw", dropout=0.0, use_cpe=True, ffn_activation="relu", **kwargs):
+    def __init__(self, d_model, d_ff, cpe_k=8, grid_size=0.05, cpe_coord_mode="raw", dropout=0.0, use_cpe=True, ffn_activation="relu", coord_dim=2, wrap_last_coord=None, **kwargs):
         super().__init__(**kwargs)
         assert ffn_activation in ("relu", "gelu")
+        self.coord_dim = coord_dim
         self.use_cpe = use_cpe
         if use_cpe:
-            self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size, coord_mode=cpe_coord_mode)
+            self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size, coord_mode=cpe_coord_mode,
+                                    coord_dim=coord_dim, wrap_last_coord=wrap_last_coord)
 
         self.global_interaction = GlobalInteractionLayer(d_model)
         self.drop1 = layers.Dropout(dropout)
@@ -781,10 +813,9 @@ class JEDIPTv3Block(layers.Layer):
 
     def call(self, inputs, training=False):
         x, coords, pt, mask = inputs
-        eta, phi = coords[..., 0], coords[..., 1]
 
         if self.use_cpe:
-            x = self.cpe(x, pt, eta, phi, mask=mask)
+            x = self.cpe(x, pt, coords, mask=mask)
 
         y = self.global_interaction(x, training=training)
         y = self.drop1(y, training=training)
@@ -824,16 +855,36 @@ def build_ptv3_jet_classifier(
     patch_tokenizer_mode="mean",   # "mean","max","flatten_dense","learned_pool"
     message_proj=True,
     message_gated=False,
-    use_flash_attention=False
+    use_flash_attention=False,
+    coord_dim=2,
+    weighted_input=True,
+    wrap_last_coord=None,
 ):
-    """Build hierarchical PTv3-inspired jet classifier."""
+    """
+    Build the PHAT-JeT classifier.
 
-    # Input: [pt, eta, phi]
-    features_input = layers.Input((num_particles, 3), name="features")
+    Input layout depends on `weighted_input`:
+      - True  (jets): [weight, coord_0, ..., coord_{coord_dim-1}], i.e. [pt, eta, phi].
+        The weight channel doubles as the padding indicator (|pt| <= 1e-6 => padded).
+      - False (generic point clouds, e.g. ModelNet): [coord_0, ..., coord_{coord_dim-1}],
+        i.e. [x, y, z]. Every point is real, so the mask is all-True — critical, since
+        keying the mask off a spatial channel would drop every point lying on that plane.
+    """
+    if cpe_coord_mode == "pt" and not weighted_input:
+        raise ValueError('cpe_coord_mode="pt" requires weighted_input=True (no weight channel otherwise)')
 
-    pt = features_input[..., 0]
-    coords = features_input[..., 1:3]  # [eta, phi]
-    mask = tf.abs(pt) > 1e-6
+    feature_dim = coord_dim + (1 if weighted_input else 0)
+
+    features_input = layers.Input((num_particles, feature_dim), name="features")
+
+    if weighted_input:
+        pt = features_input[..., 0]
+        coords = features_input[..., 1:1 + coord_dim]
+        mask = tf.abs(pt) > 1e-6
+    else:
+        coords = features_input[..., :coord_dim]
+        pt = tf.zeros_like(features_input[..., 0])
+        mask = tf.ones_like(pt, dtype=tf.bool)
     x = layers.Dense(enc_dims[0], activation="relu")(features_input)
 
     for i in range(len(enc_dims)):
@@ -854,7 +905,9 @@ def build_ptv3_jet_classifier(
                 patch_tokenizer_mode=patch_tokenizer_mode,
                 message_proj=message_proj,
                 message_gated=message_gated,
-                use_flash_attention=use_flash_attention
+                use_flash_attention=use_flash_attention,
+                coord_dim=coord_dim,
+                wrap_last_coord=wrap_last_coord
             )([x, coords, pt, mask])
 
         if i < len(enc_dims) - 1:

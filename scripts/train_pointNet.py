@@ -185,6 +185,11 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
             "label_QCD", "label_Hbb", "label_Hcc", "label_Hgg", "label_H4q",
             "label_Hqql", "label_Zqq", "label_Wqq", "label_Tbqq", "label_Tbl",
         ]
+    elif dataset == "modelnet10":
+        labels = [
+            "bathtub", "bed", "chair", "desk", "dresser",
+            "monitor", "night_stand", "sofa", "table", "toilet",
+        ]
     else:
         labels = [f"label_{i}" for i in range(preds.shape[1])]
 
@@ -224,13 +229,18 @@ def parse_args():
     p.add_argument("--data_dir", required=True)
     p.add_argument("--save_dir", required=True)
     p.add_argument(
-        "--dataset", choices=["hls4ml", "top", "QG", "jetclass"], default="hls4ml"
+        "--dataset", choices=["hls4ml", "top", "QG", "jetclass", "modelnet10"], default="hls4ml"
     )
     p.add_argument(
         "--sort_by",
-        choices=["pt", "eta", "phi", "delta_R", "kt", "cluster"],
+        choices=["pt", "eta", "phi", "delta_R", "kt", "cluster", "none"],
         default="kt",
     )
+    p.add_argument("--num_points", type=int, default=1000,
+                   help="Points per cloud for --dataset modelnet10")
+    p.add_argument("--augment", action="store_true",
+                   help="ModelNet only: random up-axis rotation + jitter each epoch")
+    p.add_argument("--jitter_sigma", type=float, default=0.01)
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--test_batch_size", type=int, default=None)
     p.add_argument("--num_epochs", type=int, default=500)
@@ -261,6 +271,10 @@ def main():
 
     if args.dataset == "jetclass":
         num_particles = 150
+        output_dim = 10
+        loss_fn = "categorical_crossentropy"
+    elif args.dataset == "modelnet10":
+        num_particles = args.num_points
         output_dim = 10
         loss_fn = "categorical_crossentropy"
     elif args.dataset == "top":
@@ -374,14 +388,32 @@ def main():
     histories = []
     for bs, ep in schedule:
         tf.keras.backend.set_value(model.optimizer.lr, 1e-3)
+        if args.augment:
+            # Same augmentation as the PHAT/PTv3 runs so the anchor stays comparable.
+            # PointNet is permutation invariant, so no re-sorting is needed here.
+            from scripts.train_point_transformer import augment_point_cloud
+
+            ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+            ds = ds.shuffle(x_train.shape[0], reshuffle_each_iteration=True).batch(bs)
+
+            def _aug(xb, yb, sigma=args.jitter_sigma):
+                xb = tf.numpy_function(
+                    lambda a: augment_point_cloud(a, jitter_sigma=sigma), [xb], tf.float32
+                )
+                xb.set_shape([None, x_train.shape[1], x_train.shape[2]])
+                return xb, yb
+
+            ds = ds.map(_aug, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+            fit_kwargs = dict(x=ds)
+        else:
+            fit_kwargs = dict(x=x_train, y=y_train, batch_size=bs)
         hist = model.fit(
-            x_train, y_train,
             validation_data=(x_val, y_val),
             initial_epoch=ce,
             epochs=ce + ep,
-            batch_size=bs,
             callbacks=[ckpt, early],
             verbose=1,
+            **fit_kwargs,
         )
         histories.append(hist)
         ce += ep

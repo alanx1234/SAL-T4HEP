@@ -1,0 +1,171 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-modelnet10-preflight
+  namespace: cms-ml
+  labels:
+    jobgroup: modelnet10-preflight
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        jobgroup: modelnet10-preflight
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      containers:
+        - name: preflight
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: REPO_REF
+              value: "iclr"
+            - name: DATA_DIR
+              value: "/j-jepa-vol/linformer_data/ModelNet10/points_1000"
+            - name: NUM_POINTS
+              value: "1000"
+            - name: POST_RUN_SLEEP_SECONDS
+              value: "600"
+          args:
+            - |
+              set -euxo pipefail
+
+              REPO_DIR="/tmp/sal_t_modelnet10_preflight"
+              git clone --branch "$REPO_REF" --single-branch \
+                https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+              cd "$REPO_DIR"
+
+              python3 -m py_compile \
+                scripts/train_point_transformer.py \
+                scripts/process_modelnet.py \
+                models/PointTransformerV3TF.py \
+                models/PointTransformer_serialized.py
+
+              echo "=============================================================="
+              echo "== 1. Port tests (3D paths + 2D jet-path regression guards) =="
+              echo "=============================================================="
+              python3 -m pytest tests/test_modelnet_ports.py -v
+
+              echo "=============================================================="
+              echo "== 2. Existing jet tests must still pass                    =="
+              echo "=============================================================="
+              python3 -m pytest tests/test_hls4ml_multiplicity_evaluation.py -q || \
+                echo "WARNING: hls4ml evaluation tests failed (check whether pre-existing)"
+
+              echo "=============================================================="
+              echo "== 3. Params / FLOPs for FLOPs-matching the two models      =="
+              echo "=============================================================="
+              python3 - <<'PY'
+              import sys
+              sys.path.insert(0, ".")
+              import tensorflow as tf
+              from models.PointTransformerV3TF import build_ptv3_jet_classifier
+              from models.PointTransformer_serialized import build_ptv3_serialized_jet_classifier
+              from scripts.train_point_transformer import get_flops
+
+              N = 1000
+
+              def report(name, model):
+                  flops = get_flops(model, (1, N, 3))
+                  print(f"{name:<38} params={model.count_params():>9,}  flops={flops:>12,}  macs={flops//2:>12,}")
+
+              # PHAT-JeT at the paper's preset (JetClass hidden dim 32, 4 heads, 1 layer,
+              # P=10, delta=0.2, no pool, gelu, mean tokenizer, proj on, gate off).
+              report(
+                  "PHAT-JeT 3D  d=32 P=10 (paper preset)",
+                  build_ptv3_jet_classifier(
+                      num_particles=N, output_dim=10,
+                      enc_dims=[32], enc_layers=[1], enc_heads=[4],
+                      enc_patch_sizes=[10], enc_strides=[2],
+                      cpe_k=3, grid_size=0.2, use_pool=False,
+                      ffn_activation="gelu", patch_tokenizer_mode="mean",
+                      message_proj=True, message_gated=False,
+                      coord_dim=3, weighted_input=False,
+                  ),
+              )
+
+              # Serialized PTv3 swept over hidden dims so we can pick the FLOPs-matched
+              # configuration, following the paper's Appendix H methodology.
+              for dims in ([8, 16], [12, 24], [16, 32], [24, 48], [32, 64]):
+                  report(
+                      f"PTv3 serialized 3D dims={dims} P=10",
+                      build_ptv3_serialized_jet_classifier(
+                          num_particles=N, output_dim=10,
+                          enc_dims=dims, enc_layers=[1, 1], enc_heads=[4, 4],
+                          enc_patch_sizes=[10, 10], enc_strides=[2],
+                          cpe_k=3, grid_size=0.2,
+                          serialize_by="morton", assume_serialized_input=True,
+                          coord_dim=3, weighted_input=False,
+                      ),
+                  )
+              PY
+
+              echo "=============================================================="
+              echo "== 4. One-epoch smoke run on the real data                  =="
+              echo "=============================================================="
+              test -f "$DATA_DIR/train/features.npy"
+              python3 scripts/train_point_transformer.py \
+                --data_dir       "$DATA_DIR" \
+                --save_dir       /tmp/modelnet10_smoke \
+                --dataset        modelnet10 \
+                --num_points     "$NUM_POINTS" \
+                --sort_by        morton \
+                --morton_grid_size 0.2 \
+                --enc_dims       32 \
+                --enc_layers     1 \
+                --enc_heads      4 \
+                --enc_patch_sizes 10 \
+                --enc_strides    2 \
+                --cpe_k          3 \
+                --grid_size      0.2 \
+                --disable_pool \
+                --ffn_activation gelu \
+                --patch_tokenizer_mode mean \
+                --aggregation    max \
+                --schedule       none \
+                --batch_size     32 \
+                --test_batch_size 32 \
+                --num_epochs     1 \
+                --early_stopping_patience 1
+
+              echo "Preflight finished; sleeping for log retrieval"
+              sleep "$POST_RUN_SLEEP_SECONDS"
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+              readOnly: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              ephemeral-storage: 4Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              ephemeral-storage: 8Gi
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol

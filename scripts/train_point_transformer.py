@@ -141,33 +141,49 @@ def profile_gpu_memory_during_inference(model, input_data):
 		mem = tf.config.experimental.get_memory_info("GPU:0")
 		return mem["current"] / (1024**2), mem["peak"] / (1024**2)
 	
-def _morton_interleave_bits_np(x: np.ndarray, y: np.ndarray, bits: int = 30) -> np.ndarray:
-    x = x.astype(np.uint64)
-    y = y.astype(np.uint64)
-    z = np.zeros_like(x, dtype=np.uint64)
+def _morton_interleave_bits_np(axes, bits: int = None) -> np.ndarray:
+    """Z-order code interleaving the bits of `len(axes)` quantized coordinate arrays."""
+    d = len(axes)
+    if bits is None:
+        # Keep the whole code inside 64 bits regardless of dimensionality.
+        bits = 63 // d
+    axes = [a.astype(np.uint64) for a in axes]
+    z = np.zeros_like(axes[0], dtype=np.uint64)
+    one = np.uint64(1)
     for i in range(bits):
-        z |= ((x >> i) & 1) << (2 * i)
-        z |= ((y >> i) & 1) << (2 * i + 1)
+        for k, a in enumerate(axes):
+            z |= ((a >> np.uint64(i)) & one) << np.uint64(d * i + k)
     return z
 
 
-def _morton_sort_indices_np(eta: np.ndarray, phi: np.ndarray, grid_size: float, bits: int = 30) -> np.ndarray:
-    eta_min = np.min(eta, axis=1, keepdims=True)
-    phi_min = np.min(phi, axis=1, keepdims=True)
+def _morton_sort_indices_np(coords, grid_size: float, bits: int = None) -> np.ndarray:
+    """
+    coords: list of [B, N] coordinate arrays (2 for jets, 3 for generic point clouds).
+    Returns ascending argsort indices along the point axis.
+    """
+    grids = []
+    for a in coords:
+        a_min = np.min(a, axis=1, keepdims=True)
+        g = np.floor((a - a_min) / grid_size).astype(np.int64)
+        grids.append(np.clip(g, 0, None).astype(np.uint64))
 
-    grid_eta = np.floor((eta - eta_min) / grid_size).astype(np.int64)
-    grid_phi = np.floor((phi - phi_min) / grid_size).astype(np.int64)
-
-    grid_eta = np.clip(grid_eta, 0, None).astype(np.uint64)
-    grid_phi = np.clip(grid_phi, 0, None).astype(np.uint64)
-
-    morton = _morton_interleave_bits_np(grid_eta, grid_phi, bits=bits)  # [B,N]
+    morton = _morton_interleave_bits_np(grids, bits=bits)  # [B,N]
     return np.argsort(morton, axis=1)  # ascending
 
 # ---------------------------
 # Sorting helper
 # ---------------------------
-def apply_sorting(x, sort_by, grid_size= 0.05):
+def apply_sorting(x, sort_by, grid_size=0.05, coord_dim=2, weighted=True):
+		"""
+		Sort points within each cloud.
+		
+		weighted=True  (jets): channels are [pt, eta, phi]; pt-based orderings available.
+		weighted=False (generic): channels are the coord_dim spatial axes; only "morton"
+		and "random" are meaningful, since there is no per-point weight to rank by.
+		"""
+		coord_start = 1 if weighted else 0
+		if not weighted and sort_by in ("pt", "kt", "eta", "phi", "delta_R"):
+			raise ValueError(f'sort_by="{sort_by}" requires a weight channel (jet datasets only)')
 		if sort_by == "pt":
 				key = x[:, :, 0]
 		elif sort_by == "eta":
@@ -179,9 +195,9 @@ def apply_sorting(x, sort_by, grid_size= 0.05):
 		elif sort_by == "kt":
 				key = x[:, :, 0] * np.sqrt(x[:, :, 1] ** 2 + x[:, :, 2] ** 2)
 		elif sort_by == "morton":
-		        eta = x[:, :, 1]
-		        phi = x[:, :, 2]
-		        idx = _morton_sort_indices_np(eta, phi, grid_size=grid_size)  # ascending
+		        # Jets serialize on (eta, phi); generic clouds on all coord_dim axes.
+		        axes = [x[:, :, i] for i in range(coord_start, coord_start + coord_dim)]
+		        idx = _morton_sort_indices_np(axes, grid_size=grid_size)  # ascending
 		        return np.take_along_axis(x, idx[:, :, None], axis=1)
 		elif sort_by == "random":
 		    B, N, C = x.shape
@@ -193,6 +209,51 @@ def apply_sorting(x, sort_by, grid_size= 0.05):
 				return x
 		idx = np.argsort(key, axis=1)[:, ::-1]
 		return np.take_along_axis(x, idx[:, :, None], axis=1)
+
+
+# ---------------------------
+# ModelNet augmentation
+# ---------------------------
+def augment_point_cloud(x, jitter_sigma=0.01, rotate=True, rng=None):
+		"""
+		Standard ModelNet augmentation applied to [B, N, 3] clouds: a random rotation about
+		the up (y) axis plus small per-point Gaussian jitter.
+		"""
+		rng = rng or np.random
+		x = np.array(x, dtype=np.float32, copy=True)
+		if rotate:
+				theta = rng.uniform(0.0, 2.0 * np.pi, size=(x.shape[0],)).astype(np.float32)
+				cos, sin = np.cos(theta), np.sin(theta)
+				x0, x2 = x[:, :, 0].copy(), x[:, :, 2].copy()
+				x[:, :, 0] = cos[:, None] * x0 + sin[:, None] * x2
+				x[:, :, 2] = -sin[:, None] * x0 + cos[:, None] * x2
+		if jitter_sigma > 0:
+				x += rng.normal(0.0, jitter_sigma, size=x.shape).astype(np.float32)
+		return x
+
+
+def make_train_dataset(x, y, batch_size, augment, sort_by, grid_size, coord_dim, weighted, jitter_sigma=0.01):
+		"""
+		Wrap the training arrays in a tf.data pipeline. Without --augment this is a plain
+		shuffled batcher. With --augment each epoch re-rotates/jitters the clouds and then
+		re-applies the ordering, since rotating after sorting would break the serialization.
+		"""
+		ds = tf.data.Dataset.from_tensor_slices((x, y))
+		ds = ds.shuffle(x.shape[0], reshuffle_each_iteration=True)
+		ds = ds.batch(batch_size)
+
+		if augment:
+				def _aug(xb, yb):
+						def _np_aug(xb_np):
+								xb_np = augment_point_cloud(xb_np, jitter_sigma=jitter_sigma)
+								return apply_sorting(xb_np, sort_by, grid_size=grid_size,
+								                     coord_dim=coord_dim, weighted=weighted)
+						xb = tf.numpy_function(_np_aug, [xb], tf.float32)
+						xb.set_shape([None, x.shape[1], x.shape[2]])
+						return xb, yb
+				ds = ds.map(_aug, num_parallel_calls=tf.data.AUTOTUNE)
+
+		return ds.prefetch(tf.data.AUTOTUNE)
 
 
 # ---------------------------
@@ -228,7 +289,7 @@ def choose_divisible_patch_sizes(stage_lengths, preferred=[64, 32, 16, 8, 4, 2, 
 # ---------------------------
 # Testing / Profiling
 # ---------------------------
-def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size, num_particles_truncate=None, enc_patch_sizes=None):
+def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size, num_particles_truncate=None, enc_patch_sizes=None, coord_dim=2, weighted=True):
 		logging.info("Starting testing phase...")
 		logging.info("Using test batch size: %d", batch_size)
 
@@ -264,7 +325,7 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 				x_chunk = np.asarray(x_test[start:end])
 				if dataset == "jetclass":
 						x_chunk = x_chunk.transpose(0, 2, 1)
-				x_chunk = apply_sorting(x_chunk, sort_by, grid_size=morton_grid_size)
+				x_chunk = apply_sorting(x_chunk, sort_by, grid_size=morton_grid_size, coord_dim=coord_dim, weighted=weighted)
 				if num_particles_truncate is not None:
 						x_chunk = x_chunk[:, :num_particles_truncate, :]
 				if pad_len:
@@ -316,6 +377,11 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 				labels = ["qcd", "top"]
 		elif dataset == "QG":  # gluon is 0 and quark is 1.
 				labels = ["Gluon", "Quark"]
+		elif dataset == "modelnet10":
+				labels = [
+						"bathtub", "bed", "chair", "desk", "dresser",
+						"monitor", "night_stand", "sofa", "table", "toilet",
+				]
 		else:
 				labels = [
 						"label_QCD",
@@ -357,7 +423,7 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 		logging.info("Avg 1/FPR@0.8: %.3f", np.nanmean(list(one_over_fpr.values())))
 
 		# background rejection combined
-		if dataset != "top" and dataset != "QG":
+		if dataset not in ("top", "QG", "modelnet10"):
 				rej_vals = []
 				for i, lab in enumerate(labels[1:], start=1):
 						mask_bg = (
@@ -388,7 +454,7 @@ def parse_args():
 		p.add_argument("--data_dir", required=True)
 		p.add_argument("--save_dir", required=True)
 		p.add_argument(
-				"--dataset", choices=["hls4ml", "top", "QG", "jetclass"], default="hls4ml"
+				"--dataset", choices=["hls4ml", "top", "QG", "jetclass", "modelnet10"], default="hls4ml"
 		)
 		p.add_argument(
 				"--sort_by",
@@ -402,6 +468,11 @@ def parse_args():
 		    default=None,
 		    help="One or more test-time orderings to evaluate. Defaults to --sort_by."
 		)
+		p.add_argument("--num_points", type=int, default=1024,
+				help="Points per cloud for --dataset modelnet10 (must match the preprocessed data)")
+		p.add_argument("--augment", action="store_true",
+				help="ModelNet only: random up-axis rotation + jitter each epoch, re-sorted after")
+		p.add_argument("--jitter_sigma", type=float, default=0.01, help="Std dev of --augment jitter")
 		p.add_argument("--batch_size", type=int, default=4096)
 		p.add_argument("--test_batch_size", type=int, default=None)
 		p.add_argument("--log_every_batches", type=int, default=100, help="Write training progress to train.log/stdout every N batches; 0 disables")
@@ -462,9 +533,25 @@ def main():
 
 		test_sorts = args.test_sort_by if args.test_sort_by is not None else [args.sort_by]
 
+		# ModelNet clouds are (x, y, z) with every point real; jets are (pt, eta, phi)
+		# where the pt channel doubles as the padding indicator.
+		is_generic_cloud = args.dataset == "modelnet10"
+		coord_dim = 3 if is_generic_cloud else 2
+		weighted_input = not is_generic_cloud
+		if is_generic_cloud and args.sort_by not in ("morton", "random"):
+				raise ValueError(
+						f'--sort_by {args.sort_by} needs a pt channel; use "morton" (recommended) '
+						'or "random" for --dataset modelnet10'
+				)
+
 		# pick num_particles & output_dim
 		if args.dataset == "jetclass":
 				num_particles = 150
+				output_dim = 10
+				loss_fn = "categorical_crossentropy"
+				feature_dim = 3
+		elif args.dataset == "modelnet10":
+				num_particles = args.num_points
 				output_dim = 10
 				loss_fn = "categorical_crossentropy"
 				feature_dim = 3
@@ -549,8 +636,8 @@ def main():
 				)
 
 				# apply sorting
-				x_train = apply_sorting(x_train, args.sort_by, grid_size=args.morton_grid_size)
-				x_val   = apply_sorting(x_val,   args.sort_by, grid_size=args.morton_grid_size)
+				x_train = apply_sorting(x_train, args.sort_by, grid_size=args.morton_grid_size, coord_dim=coord_dim, weighted=weighted_input)
+				x_val   = apply_sorting(x_val,   args.sort_by, grid_size=args.morton_grid_size, coord_dim=coord_dim, weighted=weighted_input)
 
 		# truncate to top-k particles if requested (e.g. 64 instead of 128)
 		num_particles_for_files = num_particles  # preserve original for filename lookup in run_testing
@@ -594,6 +681,14 @@ def main():
 		# (avoids gradient shape mismatch from padding inside attention layer)
 		max_patch = max(enc_patch_sizes)
 		remainder = num_particles % max_patch
+		if remainder != 0 and is_generic_cloud:
+				# Jets tolerate zero-padding because the pt channel marks padded slots. A
+				# generic cloud has no such channel, so padded rows would be indistinguishable
+				# from real points sitting at the origin. Require an exact patch division.
+				raise ValueError(
+						f"--enc_patch_sizes {max_patch} does not divide {num_particles} points; "
+						f"pick a divisor (e.g. 16, 32 or 64 for 1024) for --dataset {args.dataset}"
+				)
 		if remainder != 0:
 				pad_len = max_patch - remainder
 				if not args.test_only:
@@ -637,6 +732,8 @@ def main():
 				aggregation=args.aggregation,
 				serialize_by=args.serialize_by,
 				assume_serialized_input=args.assume_serialized_input,
+				coord_dim=coord_dim,
+				weighted_input=weighted_input,
 			)
 		else:
 			model = build_ptv3_jet_classifier(
@@ -661,6 +758,8 @@ def main():
 			    message_proj=args.message_proj,
 			    message_gated=args.message_gated,
 				cpe_coord_mode=args.cpe_coord_mode,
+				coord_dim=coord_dim,
+				weighted_input=weighted_input,
 			)
 		model.compile(
 				optimizer=tf.keras.optimizers.Adam(),
@@ -698,6 +797,8 @@ def main():
 				        morton_grid_size=args.morton_grid_size,
 				        num_particles_truncate=args.num_particles_truncate,
 				        enc_patch_sizes=enc_patch_sizes,
+				        coord_dim=coord_dim,
+				        weighted=weighted_input,
 				    )
 				return
 
@@ -721,15 +822,23 @@ def main():
 		histories = []
 		for bs, ep in schedule:
 				tf.keras.backend.set_value(model.optimizer.lr, 1e-3)
+				if args.augment:
+						# Re-randomize the clouds every epoch; needs a tf.data pipeline rather than
+						# the static arrays, and re-sorts after augmenting so the ordering stays valid.
+						train_input = make_train_dataset(
+								x_train, y_train, bs, True, args.sort_by, args.morton_grid_size,
+								coord_dim, weighted_input, jitter_sigma=args.jitter_sigma,
+						)
+						fit_kwargs = dict(x=train_input)
+				else:
+						fit_kwargs = dict(x=x_train, y=y_train, batch_size=bs)
 				hist = model.fit(
-						x_train,
-						y_train,
 						validation_data=(x_val, y_val),
 						initial_epoch=ce,
 						epochs=ce + ep,
-						batch_size=bs,
 						callbacks=[ckpt, early, progress],
 						verbose=1,
+						**fit_kwargs,
 				)
 				histories.append(hist)
 				ce += ep
@@ -782,6 +891,8 @@ def main():
 		        morton_grid_size=args.morton_grid_size,
 		        num_particles_truncate=args.num_particles_truncate,
 		        enc_patch_sizes=enc_patch_sizes,
+		        coord_dim=coord_dim,
+		        weighted=weighted_input,
 		    )
 
 

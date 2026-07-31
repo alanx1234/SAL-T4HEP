@@ -1,0 +1,90 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-modelnet10-preprocess
+  namespace: cms-ml
+  labels:
+    jobgroup: modelnet10-preprocess
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        jobgroup: modelnet10-preprocess
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: preprocess
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: REPO_REF
+              value: "iclr"
+            - name: NUM_POINTS
+              value: "1000"
+            - name: RAW_DIR
+              value: "/j-jepa-vol/linformer_data/ModelNet10/raw"
+            - name: OUT_DIR
+              value: "/j-jepa-vol/linformer_data/ModelNet10/points_1000"
+            - name: POST_RUN_SLEEP_SECONDS
+              value: "600"
+          args:
+            - |
+              set -euxo pipefail
+
+              REPO_DIR="/tmp/sal_t_modelnet10_preprocess"
+              git clone --branch "$REPO_REF" --single-branch \
+                https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+              cd "$REPO_DIR"
+
+              # trimesh is not in the base image; it is only needed for mesh surface sampling.
+              python3 -m pip install --no-cache-dir "trimesh>=4.0" || \
+                python3 -m pip install --no-cache-dir trimesh
+
+              python3 -m py_compile scripts/process_modelnet.py
+
+              mkdir -p "$RAW_DIR" "$OUT_DIR"
+
+              python3 scripts/process_modelnet.py \
+                --input_dir   "$RAW_DIR" \
+                --output_dir  "$OUT_DIR" \
+                --num_points  "$NUM_POINTS" \
+                --val_frac    0.1 \
+                --seed        42
+
+              echo "=== resulting arrays ==="
+              python3 - <<'PY'
+              import numpy as np, os
+              out = os.environ["OUT_DIR"]
+              for split in ("train", "val", "test"):
+                  x = np.load(os.path.join(out, split, "features.npy"), mmap_mode="r")
+                  y = np.load(os.path.join(out, split, "labels.npy"), mmap_mode="r")
+                  counts = np.bincount(np.asarray(y).argmax(1), minlength=10).tolist()
+                  print(f"{split}: features={x.shape} labels={y.shape} class_counts={counts}")
+                  # Clouds must be centred and inside the unit sphere.
+                  sample = np.asarray(x[: min(64, x.shape[0])])
+                  radii = np.linalg.norm(sample, axis=-1).max(axis=1)
+                  print(f"  max radius: min={radii.min():.4f} max={radii.max():.4f}")
+                  print(f"  centroid abs max: {np.abs(sample.mean(axis=1)).max():.6f}")
+              PY
+
+              echo "Preprocessing finished; sleeping for log retrieval"
+              sleep "$POST_RUN_SLEEP_SECONDS"
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              ephemeral-storage: 8Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              ephemeral-storage: 16Gi
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol

@@ -8,33 +8,45 @@ import math
 class Serialization2D(layers.Layer):
     """
     Serialization and sorting for point sequences.
-    - 'morton': 2D Z-order (Morton) on (eta, phi) grid
-    - 'pt':     sort by pt descending
-    - 'kt':     sort by pt * sqrt(eta^2 + phi^2) descending
+    - 'morton': Z-order (Morton) curve over the quantized spatial grid. 2D on (eta, phi)
+                for jets; 3D on (x, y, z) when coord_dim=3.
+    - 'pt':     sort by pt descending            (jets only)
+    - 'kt':     sort by pt * sqrt(eta^2 + phi^2) descending (jets only)
+
     Inputs:
       x:      features [B, N, C]
-      coords: either [B, N, 2] = (eta, phi) or [B, N, 3] = (pt, eta, phi)
+      coords: jets (weighted_input=True): [B, N, 2] = (eta, phi) or [B, N, 3] = (pt, eta, phi)
+              generic (weighted_input=False): [B, N, coord_dim] = (x, y, z)
+
+    NOTE: the class name is kept for checkpoint/layer-name compatibility with the existing
+    jet runs even though it now also handles 3D.
     """
-    def __init__(self, grid_size=0.05, sort_by="morton", **kwargs):
+    def __init__(self, grid_size=0.05, sort_by="morton", coord_dim=2, weighted_input=True, **kwargs):
         super().__init__(**kwargs)
+        if coord_dim not in (2, 3):
+            raise ValueError("coord_dim must be 2 or 3")
+        if not weighted_input and sort_by in ("pt", "kt"):
+            raise ValueError(f'sort_by="{sort_by}" requires a weight channel (weighted_input=True)')
         self.grid_size = grid_size
         self.sort_by = sort_by
-        
-    def _interleave_bits(self, x, y):
-        """A simplified Z-order curve (Morton code) for 2D quantization."""
-        x = tf.cast(x, tf.int64)
-        y = tf.cast(y, tf.int64)
-        z = tf.zeros_like(x)
+        self.coord_dim = coord_dim
+        self.weighted_input = weighted_input
+
+    def _interleave_bits(self, axes):
+        """Z-order (Morton) code interleaving the bits of `len(axes)` quantized axes."""
+        d = len(axes)
+        axes = [tf.cast(a, tf.int64) for a in axes]
+        z = tf.zeros_like(axes[0])
 
         one = tf.constant(1, dtype=tf.int64)
+        # Keep the total code width under 63 bits regardless of dimensionality.
+        n_bits = 63 // d
         # Interleave bits with a static Python loop so graph tracing stays simple.
-        for i in range(30):
+        for i in range(n_bits):
             shift = tf.constant(i, dtype=tf.int64)
-            mask_x = (tf.bitwise.right_shift(x, shift) & one)
-            mask_y = (tf.bitwise.right_shift(y, shift) & one)
-
-            z = z | tf.bitwise.left_shift(mask_x, 2 * i)
-            z = z | tf.bitwise.left_shift(mask_y, 2 * i + 1)
+            for axis_i, a in enumerate(axes):
+                bit = (tf.bitwise.right_shift(a, shift) & one)
+                z = z | tf.bitwise.left_shift(bit, d * i + axis_i)
         return z
 
     def call(self, inputs):
@@ -45,23 +57,19 @@ class Serialization2D(layers.Layer):
             raise ValueError("Serialization2D expects inputs=[x, coords]")
         B = tf.shape(x)[0]
         N = tf.shape(x)[1]
-        last_dim = tf.shape(coords)[-1]
-        # coords can be (eta, phi) or (pt, eta, phi)
         if coords.shape.rank is None or coords.shape.rank != 3:
-            raise ValueError("coords must be rank-3: [B, N, 2 or 3]")
+            raise ValueError("coords must be rank-3: [B, N, coord_dim (+1 for a weight channel)]")
 
-        # Decide sorting strategy
-        sort_by = tf.convert_to_tensor(self.sort_by)
         # Default: morton
         if self.sort_by == "morton":
-            eta = coords[..., -2]  # works for both 2 or 3 inputs
-            phi = coords[..., -1]
-            # Quantize to grid (min-aligned)
-            eta_min = tf.reduce_min(eta, axis=1, keepdims=True)
-            phi_min = tf.reduce_min(phi, axis=1, keepdims=True)
-            grid_eta = tf.cast((eta - eta_min) / self.grid_size, tf.int32)
-            grid_phi = tf.cast((phi - phi_min) / self.grid_size, tf.int32)
-            morton_code = self._interleave_bits(grid_eta, grid_phi)
+            # Spatial axes are the trailing coord_dim channels, so this works whether or
+            # not a leading weight (pt) channel is present.
+            spatial = [coords[..., i - self.coord_dim] for i in range(self.coord_dim)]
+            grid = []
+            for a in spatial:
+                a_min = tf.reduce_min(a, axis=1, keepdims=True)
+                grid.append(tf.cast((a - a_min) / self.grid_size, tf.int32))
+            morton_code = self._interleave_bits(grid)
             sort_idx = tf.argsort(morton_code, axis=1)  # ascending
         elif self.sort_by == "pt":
             if coords.shape[-1] < 3:
@@ -92,95 +100,119 @@ class Serialization2D(layers.Layer):
 class GeometricCPE(layers.Layer):
     """
     Convolutional Position Encoding (xCPE) that respects jet geometry.
-    Uses 2D convolution on (eta, phi) grid.
+    Uses a depthwise convolution on the quantized coordinate grid: 2D on (eta, phi) for
+    jets, 3D on (x, y, z) when coord_dim=3.
     This serves as the efficient positional injection mechanism in PTv3.
     """
-    def __init__(self, channels, kernel_size=3, grid_size=0.05, **kwargs):
+    def __init__(self, channels, kernel_size=3, grid_size=0.05, coord_dim=2,
+                 max_grid_cells=1 << 20, **kwargs):
         super().__init__(**kwargs)
+        if coord_dim not in (2, 3):
+            raise ValueError("coord_dim must be 2 or 3")
         self.channels = channels
         self.kernel_size = kernel_size
         self.grid_size = grid_size
-        
-        # 2D conv on spatial grid (mimicking sparse conv)
-        self.conv2d = layers.Conv2D(
-            channels, 
-            kernel_size=kernel_size, 
+        self.coord_dim = coord_dim
+        self.max_grid_cells = max_grid_cells
+
+        # Conv on the spatial grid (mimicking sparse conv)
+        conv_cls = layers.Conv2D if coord_dim == 2 else layers.Conv3D
+        self.conv2d = conv_cls(
+            channels,
+            kernel_size=kernel_size,
             padding="same",
             groups=channels,  # Depthwise convolution for efficiency
             use_bias=True
         )
         self.pointwise = layers.Dense(channels)
         self.norm = layers.LayerNormalization(epsilon=1e-6)
-    
-    def call(self, x, eta, phi):
+
+    def call(self, x, coords):
         """
         Args:
-            x: Features [B, N, C]
-            eta: Particle eta [B, N]
-            phi: Particle phi [B, N]
+            x:      Features [B, N, C]
+            coords: Coordinates [B, N, coord_dim]
         """
         B = tf.shape(x)[0]
         N = tf.shape(x)[1]
         C = self.channels
-        
+        D = self.coord_dim
+
         residual = x
-        
+
         # Quantize to grid
-        eta_min = tf.reduce_min(eta, axis=1, keepdims=True)
-        phi_min = tf.reduce_min(phi, axis=1, keepdims=True)
-        
-        grid_eta = tf.cast((eta - eta_min) / self.grid_size, tf.int32)
-        grid_phi = tf.cast((phi - phi_min) / self.grid_size, tf.int32)
-        
+        grid_idx = []
+        for i in range(D):
+            a = coords[..., i]
+            a_min = tf.reduce_min(a, axis=1, keepdims=True)
+            grid_idx.append(tf.cast((a - a_min) / self.grid_size, tf.int32))
+
         # Get grid dimensions
-        H = tf.reduce_max(grid_eta) + 1
-        W = tf.reduce_max(grid_phi) + 1
-        
-        # Scatter particles onto 2D grid [B, H, W, C]
+        dims = [tf.maximum(tf.reduce_max(g) + 1, 1) for g in grid_idx]
+
+        # Cap total cells so a mis-set grid_size cannot allocate an enormous buffer.
+        if self.max_grid_cells is not None:
+            total = dims[0]
+            for d in dims[1:]:
+                total = total * d
+            cap = tf.constant(self.max_grid_cells, dtype=total.dtype)
+            shrink = tf.maximum(
+                tf.cast(tf.math.ceil(tf.pow(tf.cast(total, tf.float32) / tf.cast(cap, tf.float32),
+                                            1.0 / float(D))), tf.int32),
+                1,
+            )
+            shrink = tf.where(total > cap, shrink, tf.ones_like(shrink))
+            grid_idx = [g // shrink for g in grid_idx]
+            dims = [tf.maximum(tf.reduce_max(g) + 1, 1) for g in grid_idx]
+
+        grid_idx = [tf.clip_by_value(g, 0, d - 1) for g, d in zip(grid_idx, dims)]
+
+        # Scatter points onto the grid [B, *dims, C]
         batch_idx = tf.range(B)[:, None]
         batch_idx = tf.tile(batch_idx, [1, N])
-        
-        indices = tf.stack([
-            batch_idx,
-            grid_eta,
-            grid_phi
-        ], axis=-1)  # [B, N, 3]
-        
-        indices = tf.reshape(indices, [-1, 3])
+
+        indices = tf.stack([batch_idx] + grid_idx, axis=-1)  # [B, N, 1+D]
+
+        indices = tf.reshape(indices, [-1, D + 1])
         features = tf.reshape(x, [-1, C])
-        
+
         # Create a sparse tensor equivalent
         grid = tf.scatter_nd(
             indices,
             features,
-            [B, H, W, C]
+            tf.stack([B] + dims + [tf.constant(C, dtype=tf.int32)])
         )
-        
-        # Apply 2D convolution
+
+        # Apply the depthwise convolution
         grid = self.conv2d(grid)
-        
-        # Gather back to particles
-        out = tf.gather_nd(grid, tf.reshape(indices, [B, N, 3]))
-        
+
+        # Gather back to points
+        out = tf.gather_nd(grid, tf.reshape(indices, [B, N, D + 1]))
+
         out = self.pointwise(out)
         out = self.norm(out)
-        
+
         return residual + out
 
 class QuantizedRPE(layers.Layer):
     """
     RPE using quantized relative positions with learnable table (reintroduced if needed).
     """
-    def __init__(self, num_heads, quantization_bins=32, **kwargs):
+    def __init__(self, num_heads, quantization_bins=32, coord_dim=2, wrap_last_coord=None, **kwargs):
         super().__init__(**kwargs)
+        if coord_dim not in (2, 3):
+            raise ValueError("coord_dim must be 2 or 3")
         self.num_heads = num_heads
         self.bins = quantization_bins
+        self.coord_dim = coord_dim
+        # The last axis is periodic (phi) for jets only.
+        self.wrap_last_coord = (coord_dim == 2) if wrap_last_coord is None else wrap_last_coord
         
         # Learnable bias table for quantized relative positions
         # Each dimension (eta, phi) gets its own set of bins
         self.rpe_table = self.add_weight(
             name="rpe_table",
-            shape=[2 * quantization_bins, num_heads],
+            shape=[coord_dim * quantization_bins, num_heads],
             initializer=tf.keras.initializers.TruncatedNormal(stddev=0.02),
             trainable=True
         )
@@ -188,52 +220,34 @@ class QuantizedRPE(layers.Layer):
     def call(self, coords):
         """
         Args:
-            coords: [B, T, 2] where coords[..., 0] = eta, coords[..., 1] = phi
+            coords: [B, T, coord_dim]. For jets coords[...,0]=eta, coords[...,1]=phi.
         Returns:
             bias: [B, H, T, T]
         """
-        eta = coords[..., 0]  # [B, T]
-        phi = coords[..., 1]  # [B, T]
-        
-        # Compute relative positions
-        rel_eta = eta[:, :, None] - eta[:, None, :]  # [B, T, T]
-        rel_phi = phi[:, :, None] - phi[:, None, :]
-        
-        # Handle phi periodicity
-        pi = tf.constant(math.pi, dtype=phi.dtype)
-        rel_phi = tf.math.floormod(rel_phi + pi, 2 * pi) - pi
-        
-        # Quantize to bins
-        # Map to [-bins/2, bins/2] range
-        eta_range = tf.reduce_max(tf.abs(rel_eta))
-        phi_range = tf.constant(math.pi, dtype=phi.dtype)
-        
-        # Avoid division by zero
-        eta_range = tf.maximum(eta_range, 1e-6)
-        
-        eta_bins = tf.cast(
-            rel_eta / eta_range * (self.bins // 2), 
-            tf.int32
-        )
-        phi_bins = tf.cast(
-            rel_phi / phi_range * (self.bins // 2),
-            tf.int32
-        )
-        
-        # Clamp to valid range
-        eta_bins = tf.clip_by_value(eta_bins, -self.bins // 2, self.bins // 2 - 1)
-        phi_bins = tf.clip_by_value(phi_bins, -self.bins // 2, self.bins // 2 - 1)
-        
-        # Shift to positive indices
-        eta_idx = eta_bins + self.bins // 2
-        phi_idx = phi_bins + self.bins // 2 + self.bins  # Offset for second dimension
-        
-        # Lookup in table
-        eta_bias = tf.gather(self.rpe_table, eta_idx)  # [B, T, T, H]
-        phi_bias = tf.gather(self.rpe_table, phi_idx)
-        
+        pi = tf.constant(math.pi, dtype=coords.dtype)
+        half = self.bins // 2
+        bias = None
+
+        for axis in range(self.coord_dim):
+            c = coords[..., axis]  # [B, T]
+            rel = c[:, :, None] - c[:, None, :]  # [B, T, T]
+
+            is_periodic = self.wrap_last_coord and axis == self.coord_dim - 1
+            if is_periodic:
+                rel = tf.math.floormod(rel + pi, 2 * pi) - pi
+                rel_range = pi
+            else:
+                # Avoid division by zero
+                rel_range = tf.maximum(tf.reduce_max(tf.abs(rel)), tf.cast(1e-6, coords.dtype))
+
+            bins = tf.cast(rel / rel_range * half, tf.int32)
+            bins = tf.clip_by_value(bins, -half, half - 1)
+            idx = bins + half + axis * self.bins
+
+            axis_bias = tf.gather(self.rpe_table, idx)  # [B, T, T, H]
+            bias = axis_bias if bias is None else bias + axis_bias
+
         # Combine biases
-        bias = eta_bias + phi_bias  # [B, T, T, H]
         bias = tf.transpose(bias, [0, 3, 1, 2])  # [B, H, T, T]
         
         return bias
@@ -241,7 +255,7 @@ class QuantizedRPE(layers.Layer):
 
 class PatchedAttention(layers.Layer):
     """Local attention with patching on the serialized sequence."""
-    def __init__(self, d_model, num_heads, patch_size, dropout=0.0, use_rpe=False, **kwargs):
+    def __init__(self, d_model, num_heads, patch_size, dropout=0.0, use_rpe=False, coord_dim=2, **kwargs):
         super().__init__(**kwargs)
         self.d_model = d_model
         self.num_heads = num_heads
@@ -254,7 +268,7 @@ class PatchedAttention(layers.Layer):
         self.wv = layers.Dense(d_model, use_bias=True)
         self.wo = layers.Dense(d_model, use_bias=True)
         self.dropout = layers.Dropout(dropout)
-        self.rpe = QuantizedRPE(num_heads) if use_rpe else None
+        self.rpe = QuantizedRPE(num_heads, coord_dim=coord_dim) if use_rpe else None
     
     def _split_heads(self, x, num_heads):
         b, t, d = tf.unstack(tf.shape(x)[:3])
@@ -282,8 +296,9 @@ class PatchedAttention(layers.Layer):
         # Reshape to patches
         x_patched = tf.reshape(x, [B, num_patches, P, D])
         x_patched = tf.reshape(x_patched, [B * num_patches, P, D])
-        coords_patched = tf.reshape(coords, [B, num_patches, P, 2])
-        coords_patched = tf.reshape(coords_patched, [B * num_patches, P, 2])
+        coord_dim = coords.shape[-1]
+        coords_patched = tf.reshape(coords, [B, num_patches, P, coord_dim])
+        coords_patched = tf.reshape(coords_patched, [B * num_patches, P, coord_dim])
         
         # Attention within patches
         q = self._split_heads(self.wq(x_patched), self.num_heads)
@@ -318,11 +333,12 @@ class PatchedAttention(layers.Layer):
 
 class PTv3Block(layers.Layer):
     """Transformer block with CPE."""
-    def __init__(self, d_model, d_ff, num_heads, patch_size, cpe_k=3, grid_size=0.05, dropout=0.0, use_rpe=False, **kwargs):
+    def __init__(self, d_model, d_ff, num_heads, patch_size, cpe_k=3, grid_size=0.05, dropout=0.0, use_rpe=False, coord_dim=2, **kwargs):
         super().__init__(**kwargs)
-        self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size)
+        self.coord_dim = coord_dim
+        self.cpe = GeometricCPE(d_model, kernel_size=cpe_k, grid_size=grid_size, coord_dim=coord_dim)
         self.norm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.attn = PatchedAttention(d_model, num_heads, patch_size, dropout=dropout, use_rpe=use_rpe)
+        self.attn = PatchedAttention(d_model, num_heads, patch_size, dropout=dropout, use_rpe=use_rpe, coord_dim=coord_dim)
         self.drop1 = layers.Dropout(dropout)
         self.norm2 = layers.LayerNormalization(epsilon=1e-6)
         self.ffn = tf.keras.Sequential([
@@ -334,10 +350,9 @@ class PTv3Block(layers.Layer):
     
     def call(self, inputs, training=False):
         x, coords = inputs
-        eta, phi = coords[..., 0], coords[..., 1]
         
         # CPE
-        x = self.cpe(x, eta, phi)
+        x = self.cpe(x, coords)
         
         # Attention
         y = self.attn(self.norm1(x), coords, training=training)
@@ -411,26 +426,40 @@ def build_ptv3_serialized_jet_classifier(
     serialize_by="morton",
     use_pool=True,
     assume_serialized_input=False,
+    coord_dim=2,
+    weighted_input=True,
 ):
-    """Build hierarchical PTv3-inspired jet classifier with serialization."""
-    
-    # Input: [pt, eta, phi]
-    features_input = layers.Input((num_particles, 3), name="features")
-    
-    # Keep the full triplet only for serialization keys; blocks operate on (eta, phi).
-    sort_coords = features_input[..., 0:3]
-    coords = features_input[..., 1:3]
-    
+    """
+    Build the hierarchical PTv3-inspired classifier with serialization.
+
+    Input layout depends on `weighted_input`:
+      - True  (jets): [pt, eta, phi]; pt is kept only as a serialization key.
+      - False (generic point clouds, e.g. ModelNet): [x, y, z], all channels spatial.
+    """
+    feature_dim = coord_dim + (1 if weighted_input else 0)
+
+    features_input = layers.Input((num_particles, feature_dim), name="features")
+
+    # Keep the full tuple only for serialization keys; blocks operate on the spatial coords.
+    coord_start = 1 if weighted_input else 0
+    sort_coords = features_input[..., 0:feature_dim]
+    coords = features_input[..., coord_start:coord_start + coord_dim]
+
     # Initial projection
     x = layers.Dense(enc_dims[0], activation="relu")(features_input)
-    
+
     # ------------------ START Serialization Injection ------------------
     # Step 1: Serialize the initial point cloud.
     # All subsequent layers (Blocks and Pooling) operate on this sorted sequence.
     # Choose sorting with sort_by: "morton" (default), "pt", or "kt".
     if not assume_serialized_input:
-        x, sort_coords = Serialization2D(grid_size=grid_size, sort_by=serialize_by)([x, sort_coords])
-        coords = sort_coords[..., 1:3]
+        x, sort_coords = Serialization2D(
+            grid_size=grid_size,
+            sort_by=serialize_by,
+            coord_dim=coord_dim,
+            weighted_input=weighted_input,
+        )([x, sort_coords])
+        coords = sort_coords[..., coord_start:coord_start + coord_dim]
     # ------------------- END Serialization Injection -------------------
     
     # Hierarchical encoder
@@ -446,6 +475,7 @@ def build_ptv3_serialized_jet_classifier(
                 grid_size=grid_size,
                 dropout=dropout,
                 use_rpe=use_rpe,
+                coord_dim=coord_dim,
             )([x, coords])
         
         # Downsample (except last stage)
