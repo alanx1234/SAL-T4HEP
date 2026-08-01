@@ -49,6 +49,17 @@ spec:
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+            # Depthwise Conv3D (feature_group_count = channels) trips a cuDNN 8.9.7 bug
+            # on some GPUs: the XLA algorithm picker compares candidate convolutions,
+            # two disagree, and one then makes an illegal memory access that aborts the
+            # process. Pinning a single algorithm avoids the comparison path entirely.
+            # This changes neither the architecture nor the numerics, only kernel choice.
+            - name: TF_CUDNN_USE_AUTOTUNE
+              value: "0"
+            - name: XLA_FLAGS
+              value: "--xla_gpu_autotune_level=0"
+            - name: TF_FORCE_GPU_ALLOW_GROWTH
+              value: "true"
             - name: REPO_REF
               value: "modelnet10"
             - name: DATA_DIR
