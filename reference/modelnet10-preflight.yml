@@ -55,6 +55,9 @@ spec:
                 https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
               cd "$REPO_DIR"
 
+              # pytest is not in the base image.
+              python3 -m pip install --no-cache-dir pytest
+
               python3 -m py_compile \
                 scripts/train_point_transformer.py \
                 scripts/process_modelnet.py \
