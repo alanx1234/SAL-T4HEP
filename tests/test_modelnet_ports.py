@@ -132,6 +132,49 @@ def test_generic_cloud_keeps_every_point():
     assert not np.allclose(baseline, model.predict(moved, verbose=0), atol=1e-6)
 
 
+def test_height_map_layout_keeps_points_on_the_z_zero_plane():
+    """
+    Height-map layout is [z, x, y]: a 2D grid on x-y plus one leading scalar channel,
+    structurally identical to a jet's [pt, eta, phi]. But z is a signed coordinate, not an
+    intensity, so masking on |channel 0| <= 1e-6 would delete a horizontal slice through the
+    middle of every centred shape. mask_from_weight=False must prevent that.
+    """
+    model = build_ptv3_jet_classifier(
+        **phat_kwargs(coord_dim=2, weighted_input=True, mask_from_weight=False)
+    )
+    assert model.input_shape == (None, NUM_POINTS, 3)
+
+    rng = np.random.default_rng(11)
+    x = rng.normal(size=(4, NUM_POINTS, 3)).astype("float32")
+    x[:, :6, 0] = 0.0  # points sitting exactly on the z = 0 plane
+
+    baseline = model.predict(x, verbose=0)
+    moved = x.copy()
+    moved[:, :6, 1:] += 0.5  # move them within the x-y grid
+    assert not np.allclose(baseline, model.predict(moved, verbose=0), atol=1e-6), \
+        "points at z=0 were masked out of the height-map model"
+
+
+def test_height_map_uses_conv2d_not_conv3d():
+    model = build_ptv3_jet_classifier(
+        **phat_kwargs(coord_dim=2, weighted_input=True, mask_from_weight=False)
+    )
+    assert not [l for l in model.submodules if isinstance(l, tf.keras.layers.Conv3D)]
+    assert [l for l in model.submodules if isinstance(l, tf.keras.layers.Conv2D)]
+
+
+def test_mask_from_weight_still_defaults_to_jet_behaviour():
+    """Jets must keep masking on pt unless explicitly told otherwise."""
+    explicit = build_ptv3_jet_classifier(**phat_kwargs(output_dim=5, mask_from_weight=True))
+    default = build_ptv3_jet_classifier(**phat_kwargs(output_dim=5))
+    assert explicit.count_params() == default.count_params()
+
+    with pytest.raises(ValueError, match="mask_from_weight"):
+        build_ptv3_jet_classifier(
+            **phat_kwargs(coord_dim=3, weighted_input=False, mask_from_weight=True)
+        )
+
+
 def test_pt_coord_mode_rejected_without_weight_channel():
     with pytest.raises(ValueError, match="weighted_input"):
         build_ptv3_jet_classifier(

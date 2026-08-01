@@ -298,7 +298,7 @@ def choose_divisible_patch_sizes(stage_lengths, preferred=[64, 32, 16, 8, 4, 2, 
 # ---------------------------
 # Testing / Profiling
 # ---------------------------
-def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size, num_particles_truncate=None, enc_patch_sizes=None, coord_dim=2, weighted=True):
+def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_particles, morton_grid_size, num_particles_truncate=None, enc_patch_sizes=None, coord_dim=2, weighted=True, height_map=False):
 		logging.info("Starting testing phase...")
 		logging.info("Using test batch size: %d", batch_size)
 
@@ -334,6 +334,10 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 				x_chunk = np.asarray(x_test[start:end])
 				if dataset == "jetclass":
 						x_chunk = x_chunk.transpose(0, 2, 1)
+				if height_map:
+						# (x, y, z) -> (z, x, y): grid on the x-y ground plane with z as the
+						# leading scalar channel, mirroring how jets carry pt alongside (eta, phi).
+						x_chunk = x_chunk[..., [2, 0, 1]]
 				x_chunk = apply_sorting(x_chunk, sort_by, grid_size=morton_grid_size, coord_dim=coord_dim, weighted=weighted)
 				if num_particles_truncate is not None:
 						x_chunk = x_chunk[:, :num_particles_truncate, :]
@@ -479,6 +483,8 @@ def parse_args():
 		)
 		p.add_argument("--num_points", type=int, default=1024,
 				help="Points per cloud for --dataset modelnet10 (must match the preprocessed data)")
+		p.add_argument("--height_map", action="store_true",
+				help="ModelNet only: reorder (x,y,z)->(z,x,y) and grid on the x-y plane only, so PHAT runs its unmodified 2D jet path with z as the leading scalar channel")
 		p.add_argument("--augment", action="store_true",
 				help="ModelNet only: random up-axis rotation + jitter each epoch, re-sorted after")
 		p.add_argument("--jitter_sigma", type=float, default=0.01, help="Std dev of --augment jitter")
@@ -547,8 +553,21 @@ def main():
 		# ModelNet clouds are (x, y, z) with every point real; jets are (pt, eta, phi)
 		# where the pt channel doubles as the padding indicator.
 		is_generic_cloud = args.dataset == "modelnet10"
-		coord_dim = 3 if is_generic_cloud else 2
-		weighted_input = not is_generic_cloud
+		if args.height_map and not is_generic_cloud:
+				raise ValueError("--height_map is only valid for --dataset modelnet10")
+		if args.height_map:
+				# Height-map layout: [z, x, y]. Structurally identical to a jet's
+				# [pt, eta, phi] -- a 2D grid plus one leading scalar channel -- so PHAT runs
+				# its unmodified 2D path. The mask must NOT come from that channel: z is a
+				# signed coordinate, so |z| <= 1e-6 would delete a horizontal slice through
+				# the middle of every centred shape.
+				coord_dim = 2
+				weighted_input = True
+				mask_from_weight = False
+		else:
+				coord_dim = 3 if is_generic_cloud else 2
+				weighted_input = not is_generic_cloud
+				mask_from_weight = weighted_input
 		if is_generic_cloud and args.sort_by not in ("morton", "random"):
 				raise ValueError(
 						f'--sort_by {args.sort_by} needs a pt channel; use "morton" (recommended) '
@@ -647,6 +666,9 @@ def main():
 				)
 
 				# apply sorting
+				if args.height_map:
+						x_train = x_train[..., [2, 0, 1]]
+						x_val   = x_val[...,   [2, 0, 1]]
 				x_train = apply_sorting(x_train, args.sort_by, grid_size=args.morton_grid_size, coord_dim=coord_dim, weighted=weighted_input)
 				x_val   = apply_sorting(x_val,   args.sort_by, grid_size=args.morton_grid_size, coord_dim=coord_dim, weighted=weighted_input)
 
@@ -771,6 +793,7 @@ def main():
 				cpe_coord_mode=args.cpe_coord_mode,
 				coord_dim=coord_dim,
 				weighted_input=weighted_input,
+				mask_from_weight=mask_from_weight,
 			)
 		model.compile(
 				optimizer=tf.keras.optimizers.Adam(),
@@ -810,6 +833,7 @@ def main():
 				        enc_patch_sizes=enc_patch_sizes,
 				        coord_dim=coord_dim,
 				        weighted=weighted_input,
+				        height_map=args.height_map,
 				    )
 				return
 
@@ -905,6 +929,7 @@ def main():
 		        enc_patch_sizes=enc_patch_sizes,
 		        coord_dim=coord_dim,
 		        weighted=weighted_input,
+		        height_map=args.height_map,
 		    )
 
 

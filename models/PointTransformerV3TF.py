@@ -859,6 +859,7 @@ def build_ptv3_jet_classifier(
     coord_dim=2,
     weighted_input=True,
     wrap_last_coord=None,
+    mask_from_weight=None,
 ):
     """
     Build the PHAT-JeT classifier.
@@ -869,9 +870,19 @@ def build_ptv3_jet_classifier(
       - False (generic point clouds, e.g. ModelNet): [coord_0, ..., coord_{coord_dim-1}],
         i.e. [x, y, z]. Every point is real, so the mask is all-True — critical, since
         keying the mask off a spatial channel would drop every point lying on that plane.
+
+    `mask_from_weight` decouples masking from the layout, and defaults to `weighted_input`.
+    Set it False for a height-map style input such as [z, x, y], where the leading channel
+    is a signed coordinate rather than an intensity: masking on |z| <= 1e-6 would silently
+    delete a horizontal slice through the middle of every (centred) shape.
     """
     if cpe_coord_mode == "pt" and not weighted_input:
         raise ValueError('cpe_coord_mode="pt" requires weighted_input=True (no weight channel otherwise)')
+
+    if mask_from_weight is None:
+        mask_from_weight = weighted_input
+    if mask_from_weight and not weighted_input:
+        raise ValueError("mask_from_weight=True requires weighted_input=True")
 
     feature_dim = coord_dim + (1 if weighted_input else 0)
 
@@ -880,7 +891,7 @@ def build_ptv3_jet_classifier(
     if weighted_input:
         pt = features_input[..., 0]
         coords = features_input[..., 1:1 + coord_dim]
-        mask = tf.abs(pt) > 1e-6
+        mask = tf.abs(pt) > 1e-6 if mask_from_weight else tf.ones_like(pt, dtype=tf.bool)
     else:
         coords = features_input[..., :coord_dim]
         pt = tf.zeros_like(features_input[..., 0])
