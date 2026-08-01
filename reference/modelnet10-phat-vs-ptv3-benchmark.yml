@@ -193,6 +193,6 @@ spec:
               cpu: "4"
               nvidia.com/gpu: "1"
             limits:
-              memory: 64Gi
-              cpu: "8"
+              memory: 32Gi
+              cpu: "4"
               nvidia.com/gpu: "1"

@@ -81,8 +81,8 @@ spec:
               memory: 16Gi
               ephemeral-storage: 8Gi
             limits:
-              cpu: "8"
-              memory: 32Gi
+              cpu: "4"
+              memory: 16Gi
               ephemeral-storage: 16Gi
       volumes:
         - name: work
