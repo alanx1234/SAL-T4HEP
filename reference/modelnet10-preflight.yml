@@ -39,7 +39,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: REPO_REF
-              value: "iclr"
+              value: "modelnet10"
             - name: DATA_DIR
               value: "/j-jepa-vol/linformer_data/ModelNet10/points_1000"
             - name: NUM_POINTS
