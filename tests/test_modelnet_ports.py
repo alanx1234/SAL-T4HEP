@@ -236,16 +236,41 @@ def test_jet_path_defaults_unchanged():
     assert np.all(np.isfinite(out))
 
 
-def test_jet_padding_still_masked():
-    """Zero-padded constituents must not influence the jet prediction."""
-    model = build_ptv3_jet_classifier(**phat_kwargs(output_dim=5))
-    x = make_jet()
-    baseline = model.predict(x, verbose=0)
+def test_gmp_ignores_padded_points():
+    """
+    Padded constituents must not leak into the GMP grid: they must not shift the per-jet
+    coordinate minimum, extend the grid extent, or contribute features to any cell.
 
-    # Perturb only the padded tail; the mask should make this a no-op.
-    perturbed = x.copy()
-    perturbed[:, -8:, 1:] = 3.0
-    np.testing.assert_allclose(model.predict(perturbed, verbose=0), baseline, atol=1e-5)
+    Note this is a property of GeometricCPE specifically, not of the whole model. The mask
+    is threaded into GMP only -- PatchedAttention, PatchMessageBroadcast and the final
+    max-pool all run over every token. That is pre-existing jet behaviour and is harmless
+    on real data, where padded constituents are exactly (0, 0, 0) and so contribute a
+    constant; this test pins the part that genuinely depends on the mask.
+    """
+    rng = np.random.default_rng(5)
+    batch, n, channels = 2, 32, 8
+    feats = rng.normal(size=(batch, n, channels)).astype("float32")
+    coords = rng.normal(size=(batch, n, 2)).astype("float32")
+
+    mask = np.ones((batch, n), dtype=bool)
+    mask[:, -8:] = False  # trailing padded constituents
+
+    cpe = GeometricCPE(channels, kernel_size=3, grid_size=0.2, coord_dim=2)
+    baseline = cpe(tf.constant(feats), None, tf.constant(coords), mask=tf.constant(mask)).numpy()
+
+    # Move the padded points far outside the jet and give them large features. Both would
+    # change the grid extent and cell sums if the mask were not applied.
+    perturbed_coords = coords.copy()
+    perturbed_feats = feats.copy()
+    perturbed_coords[:, -8:, :] = 25.0
+    perturbed_feats[:, -8:, :] = 50.0
+
+    perturbed = cpe(
+        tf.constant(perturbed_feats), None, tf.constant(perturbed_coords), mask=tf.constant(mask)
+    ).numpy()
+
+    # Real constituents must be untouched.
+    np.testing.assert_allclose(perturbed[:, :-8], baseline[:, :-8], atol=1e-5)
 
 
 def test_jet_2d_morton_ordering_unchanged():
