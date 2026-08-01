@@ -214,25 +214,34 @@ def apply_sorting(x, sort_by, grid_size=0.05, coord_dim=2, weighted=True):
 # ---------------------------
 # ModelNet augmentation
 # ---------------------------
-def augment_point_cloud(x, jitter_sigma=0.01, rotate=True, rng=None):
+def augment_point_cloud(x, jitter_sigma=0.01, rotate=True, rng=None, up_axis=2):
 		"""
 		Standard ModelNet augmentation applied to [B, N, 3] clouds: a random rotation about
-		the up (y) axis plus small per-point Gaussian jitter.
+		the up axis plus small per-point Gaussian jitter.
+
+		up_axis defaults to 2 (z) because raw ModelNet .off meshes are z-up. This differs
+		from the original PointNet provider.py, which rotates about y -- that code consumes
+		pre-converted y-up HDF5 data, not the .off meshes we sample from. Rotating about the
+		wrong axis does not augment the data, it tips every object onto its side.
 		"""
+		if up_axis not in (0, 1, 2):
+				raise ValueError("up_axis must be 0 (x), 1 (y) or 2 (z)")
 		rng = rng or np.random
 		x = np.array(x, dtype=np.float32, copy=True)
 		if rotate:
+				# The two axes spanning the ground plane, i.e. everything but the up axis.
+				a, b = [i for i in (0, 1, 2) if i != up_axis]
 				theta = rng.uniform(0.0, 2.0 * np.pi, size=(x.shape[0],)).astype(np.float32)
 				cos, sin = np.cos(theta), np.sin(theta)
-				x0, x2 = x[:, :, 0].copy(), x[:, :, 2].copy()
-				x[:, :, 0] = cos[:, None] * x0 + sin[:, None] * x2
-				x[:, :, 2] = -sin[:, None] * x0 + cos[:, None] * x2
+				xa, xb = x[:, :, a].copy(), x[:, :, b].copy()
+				x[:, :, a] = cos[:, None] * xa + sin[:, None] * xb
+				x[:, :, b] = -sin[:, None] * xa + cos[:, None] * xb
 		if jitter_sigma > 0:
 				x += rng.normal(0.0, jitter_sigma, size=x.shape).astype(np.float32)
 		return x
 
 
-def make_train_dataset(x, y, batch_size, augment, sort_by, grid_size, coord_dim, weighted, jitter_sigma=0.01):
+def make_train_dataset(x, y, batch_size, augment, sort_by, grid_size, coord_dim, weighted, jitter_sigma=0.01, up_axis=2):
 		"""
 		Wrap the training arrays in a tf.data pipeline. Without --augment this is a plain
 		shuffled batcher. With --augment each epoch re-rotates/jitters the clouds and then
@@ -245,7 +254,7 @@ def make_train_dataset(x, y, batch_size, augment, sort_by, grid_size, coord_dim,
 		if augment:
 				def _aug(xb, yb):
 						def _np_aug(xb_np):
-								xb_np = augment_point_cloud(xb_np, jitter_sigma=jitter_sigma)
+								xb_np = augment_point_cloud(xb_np, jitter_sigma=jitter_sigma, up_axis=up_axis)
 								return apply_sorting(xb_np, sort_by, grid_size=grid_size,
 								                     coord_dim=coord_dim, weighted=weighted)
 						xb = tf.numpy_function(_np_aug, [xb], tf.float32)
@@ -473,6 +482,8 @@ def parse_args():
 		p.add_argument("--augment", action="store_true",
 				help="ModelNet only: random up-axis rotation + jitter each epoch, re-sorted after")
 		p.add_argument("--jitter_sigma", type=float, default=0.01, help="Std dev of --augment jitter")
+		p.add_argument("--up_axis", type=int, choices=[0, 1, 2], default=2,
+				help="Vertical axis for --augment rotation. ModelNet .off meshes are z-up (2).")
 		p.add_argument("--batch_size", type=int, default=4096)
 		p.add_argument("--test_batch_size", type=int, default=None)
 		p.add_argument("--log_every_batches", type=int, default=100, help="Write training progress to train.log/stdout every N batches; 0 disables")
@@ -828,6 +839,7 @@ def main():
 						train_input = make_train_dataset(
 								x_train, y_train, bs, True, args.sort_by, args.morton_grid_size,
 								coord_dim, weighted_input, jitter_sigma=args.jitter_sigma,
+								up_axis=args.up_axis,
 						)
 						fit_kwargs = dict(x=train_input)
 				else:

@@ -212,15 +212,28 @@ def test_serialization_layer_rejects_pt_sorting_without_weights():
         Serialization2D(sort_by="kt", coord_dim=3, weighted_input=False)
 
 
-def test_augment_preserves_shape_and_rotates_about_up_axis():
+def test_augment_rotates_about_z_by_default():
+    """
+    ModelNet .off meshes are z-up, so the default rotation must preserve z. Rotating
+    about y instead would tip every object onto its side rather than spinning it.
+    """
     x = make_cloud(seed=7)
     aug = augment_point_cloud(x, jitter_sigma=0.0, rng=np.random.default_rng(1))
     assert aug.shape == x.shape
-    # A rotation about y preserves the y coordinate and each point's distance from that axis.
-    np.testing.assert_allclose(aug[..., 1], x[..., 1], atol=1e-5)
-    r_before = np.linalg.norm(x[..., [0, 2]], axis=-1)
-    r_after = np.linalg.norm(aug[..., [0, 2]], axis=-1)
+    # A rotation about z preserves the z coordinate and each point's distance from that axis.
+    np.testing.assert_allclose(aug[..., 2], x[..., 2], atol=1e-5)
+    r_before = np.linalg.norm(x[..., [0, 1]], axis=-1)
+    r_after = np.linalg.norm(aug[..., [0, 1]], axis=-1)
     np.testing.assert_allclose(r_after, r_before, atol=1e-5)
+
+
+def test_augment_up_axis_is_configurable():
+    x = make_cloud(seed=7)
+    for up in (0, 1, 2):
+        aug = augment_point_cloud(x, jitter_sigma=0.0, up_axis=up, rng=np.random.default_rng(1))
+        np.testing.assert_allclose(aug[..., up], x[..., up], atol=1e-5)
+    with pytest.raises(ValueError, match="up_axis"):
+        augment_point_cloud(x, up_axis=3)
 
 
 # --------------------------------------------------------------------------------------

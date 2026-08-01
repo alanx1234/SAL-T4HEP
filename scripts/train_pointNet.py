@@ -241,6 +241,8 @@ def parse_args():
     p.add_argument("--augment", action="store_true",
                    help="ModelNet only: random up-axis rotation + jitter each epoch")
     p.add_argument("--jitter_sigma", type=float, default=0.01)
+    p.add_argument("--up_axis", type=int, choices=[0, 1, 2], default=2,
+                   help="Vertical axis for --augment rotation. ModelNet .off meshes are z-up (2).")
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--test_batch_size", type=int, default=None)
     p.add_argument("--num_epochs", type=int, default=500)
@@ -396,9 +398,9 @@ def main():
             ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
             ds = ds.shuffle(x_train.shape[0], reshuffle_each_iteration=True).batch(bs)
 
-            def _aug(xb, yb, sigma=args.jitter_sigma):
+            def _aug(xb, yb, sigma=args.jitter_sigma, up=args.up_axis):
                 xb = tf.numpy_function(
-                    lambda a: augment_point_cloud(a, jitter_sigma=sigma), [xb], tf.float32
+                    lambda a: augment_point_cloud(a, jitter_sigma=sigma, up_axis=up), [xb], tf.float32
                 )
                 xb.set_shape([None, x_train.shape[1], x_train.shape[2]])
                 return xb, yb

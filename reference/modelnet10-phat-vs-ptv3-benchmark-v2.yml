@@ -1,0 +1,226 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-modelnet10-phat-vs-ptv3-v2
+  namespace: cms-ml
+  labels:
+    jobgroup: modelnet10-phat-vs-ptv3-v2
+spec:
+  completions: 18
+  parallelism: 9
+  completionMode: Indexed
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        jobgroup: modelnet10-phat-vs-ptv3-v2
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-Quadro-RTX-6000
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-Quadro-RTX-8000
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command: ["/bin/bash", "-lc"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # Depthwise Conv3D (feature_group_count = channels) trips a cuDNN 8.9.7 bug
+            # on some GPUs: the XLA algorithm picker compares candidate convolutions,
+            # two disagree, and one then makes an illegal memory access that aborts the
+            # process. Pinning a single algorithm avoids the comparison path entirely.
+            # This changes neither the architecture nor the numerics, only kernel choice.
+            - name: TF_CUDNN_USE_AUTOTUNE
+              value: "0"
+            - name: XLA_FLAGS
+              value: "--xla_gpu_autotune_level=0"
+            - name: TF_FORCE_GPU_ALLOW_GROWTH
+              value: "true"
+            - name: REPO_REF
+              value: "modelnet10"
+            - name: DATA_DIR
+              value: "/j-jepa-vol/linformer_data/ModelNet10/points_1000"
+            - name: SAVE_BASE
+              value: "/j-jepa-vol/modelnet10_phat_vs_ptv3_runs_v2"
+            - name: NUM_POINTS
+              value: "1000"
+            # PHAT-JeT paper preset (Appendix E + Table 8 top row), unchanged apart from
+            # the 2D->3D coordinate generalization.
+            - name: PATCH_SIZE
+              value: "10"
+            - name: GRID_SIZE
+              value: "0.2"
+            - name: PHAT_DIM
+              value: "32"
+            # Serialized PTv3 hidden dims, chosen to FLOPs-match PHAT-JeT from the
+            # preflight table: PHAT d=32 is 30.54M FLOPs / 21,514 params, PTv3 [32,64]
+            # is 28.90M FLOPs / 77,962 params (5.4%% under, the same tolerance as the
+            # paper's own matched comparison in Table 15).
+            - name: PTV3_DIMS
+              value: "32 64"
+          args:
+            - |
+              set -euxo pipefail
+
+              # indices  0-8 : augmented   (random rotation about the z / up axis + jitter)
+              # indices 9-17 : no augmentation
+              # within each block of 9:
+              #   +0..2 PHAT-JeT (paper preset, 3D GMP)
+              #   +3..5 Serialized PTv3 (3D Morton)
+              #   +6..8 PointNet (data-pipeline anchor)
+
+              IDX=$JOB_COMPLETION_INDEX
+              BLOCK=$((IDX / 9))
+              MODEL_IDX=$(((IDX % 9) / 3))
+              TRIAL_IDX=$((IDX % 3))
+
+              if [ "$BLOCK" -eq 0 ]; then
+                AUG_FLAG="--augment"
+                AUG_TAG="aug"
+              else
+                AUG_FLAG=""
+                AUG_TAG="noaug"
+              fi
+
+              REPO_DIR="/tmp/sal_t_modelnet10_benchmark"
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout "$REPO_REF"
+                git pull || true
+              else
+                git clone https://github.com/alanx1234/SAL-T4HEP.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout "$REPO_REF"
+              fi
+
+              RUN_TAG="${AUG_TAG}-idx-${IDX}-trial-${TRIAL_IDX}"
+              mkdir -p "$SAVE_BASE"
+
+              test -f "$DATA_DIR/train/features.npy"
+              test -f "$DATA_DIR/train/labels.npy"
+              test -f "$DATA_DIR/val/features.npy"
+              test -f "$DATA_DIR/val/labels.npy"
+              test -f "$DATA_DIR/test/features.npy"
+              test -f "$DATA_DIR/test/labels.npy"
+
+              cd "$REPO_DIR/scripts"
+              python3 -m py_compile train_point_transformer.py train_pointNet.py
+
+              if [ "$MODEL_IDX" -eq 0 ]; then
+                echo "=== ModelNet10: PHAT-JeT paper preset (index=$IDX) ==="
+                python3 train_point_transformer.py \
+                  --data_dir              "$DATA_DIR" \
+                  --save_dir              "$SAVE_BASE/phat_jet/$RUN_TAG" \
+                  --dataset               modelnet10 \
+                  --num_points            "$NUM_POINTS" \
+                  --sort_by               morton \
+                  --morton_grid_size      "$GRID_SIZE" \
+                  --enc_dims              "$PHAT_DIM" \
+                  --enc_layers            1 \
+                  --enc_heads             4 \
+                  --enc_patch_sizes       "$PATCH_SIZE" \
+                  --enc_strides           2 \
+                  --cpe_k                 3 \
+                  --grid_size             "$GRID_SIZE" \
+                  --disable_pool \
+                  --ffn_activation        gelu \
+                  --use_patch_messages \
+                  --patch_tokenizer_mode  mean \
+                  --message_proj \
+                  --no_message_gated \
+                  --aggregation           max \
+                  --up_axis               2 \
+                  $AUG_FLAG \
+                  --schedule              none \
+                  --batch_size            32 \
+                  --test_batch_size       32 \
+                  --num_epochs            200 \
+                  --early_stopping_patience 20
+
+              elif [ "$MODEL_IDX" -eq 1 ]; then
+                echo "=== ModelNet10: Serialized PTv3 (index=$IDX) ==="
+                python3 train_point_transformer.py \
+                  --data_dir              "$DATA_DIR" \
+                  --save_dir              "$SAVE_BASE/ptv3_serialized/$RUN_TAG" \
+                  --dataset               modelnet10 \
+                  --num_points            "$NUM_POINTS" \
+                  --sort_by               morton \
+                  --morton_grid_size      "$GRID_SIZE" \
+                  --enc_dims              $PTV3_DIMS \
+                  --enc_layers            1 1 \
+                  --enc_heads             4 4 \
+                  --enc_patch_sizes       "$PATCH_SIZE" "$PATCH_SIZE" \
+                  --enc_strides           2 \
+                  --cpe_k                 3 \
+                  --grid_size             "$GRID_SIZE" \
+                  --aggregation           max \
+                  --use_serialized_model \
+                  --serialize_by          morton \
+                  --assume_serialized_input \
+                  --up_axis               2 \
+                  $AUG_FLAG \
+                  --schedule              none \
+                  --batch_size            32 \
+                  --test_batch_size       32 \
+                  --num_epochs            200 \
+                  --early_stopping_patience 20
+
+              else
+                echo "=== ModelNet10: PointNet data-pipeline anchor (index=$IDX) ==="
+                # Not FLOPs-matched: this run exists to confirm the mesh sampling and
+                # label pipeline are sound. PointNet should reach roughly 89-92% here.
+                python3 train_pointNet.py \
+                  --data_dir        "$DATA_DIR" \
+                  --save_dir        "$SAVE_BASE/pointnet/$RUN_TAG" \
+                  --dataset         modelnet10 \
+                  --num_points      "$NUM_POINTS" \
+                  --sort_by         none \
+                  --base_width      64 \
+                  --up_axis         2 \
+                  $AUG_FLAG \
+                  --schedule        none \
+                  --batch_size      32 \
+                  --test_batch_size 32 \
+                  --num_epochs      200 \
+                  --early_stopping_patience 20
+              fi
+
+          volumeMounts:
+            - name: work
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              memory: 32Gi
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: 32Gi
+              cpu: "4"
+              nvidia.com/gpu: "1"
