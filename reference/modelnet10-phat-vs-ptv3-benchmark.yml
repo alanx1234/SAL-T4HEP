@@ -65,10 +65,12 @@ spec:
               value: "0.2"
             - name: PHAT_DIM
               value: "32"
-            # Serialized PTv3 hidden dims, chosen to FLOPs-match PHAT-JeT.
-            # UPDATE THIS from the preflight job's params/FLOPs table before launching.
+            # Serialized PTv3 hidden dims, chosen to FLOPs-match PHAT-JeT from the
+            # preflight table: PHAT d=32 is 30.54M FLOPs / 21,514 params, PTv3 [32,64]
+            # is 28.90M FLOPs / 77,962 params (5.4%% under, the same tolerance as the
+            # paper's own matched comparison in Table 15).
             - name: PTV3_DIMS
-              value: "16 32"
+              value: "32 64"
           args:
             - |
               set -euxo pipefail
