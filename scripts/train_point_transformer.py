@@ -390,11 +390,16 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 				labels = ["qcd", "top"]
 		elif dataset == "QG":  # gluon is 0 and quark is 1.
 				labels = ["Gluon", "Quark"]
-		elif dataset == "modelnet10":
-				labels = [
-						"bathtub", "bed", "chair", "desk", "dresser",
-						"monitor", "night_stand", "sofa", "table", "toilet",
-				]
+		elif dataset in ("modelnet10", "modelnet40"):
+				# Names come from classes.json written by process_modelnet.py, so ModelNet40's
+				# 40 labels need no hardcoding and can never drift from the label indices.
+				try:
+						import json as _json
+						with open(os.path.join(data_dir, "classes.json")) as _fh:
+								_cls = _json.load(_fh)
+						labels = [n for n, _ in sorted(_cls.items(), key=lambda kv: kv[1])]
+				except Exception:
+						labels = [f"class_{i}" for i in range(preds.shape[1])]
 		else:
 				labels = [
 						"label_QCD",
@@ -436,7 +441,7 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
 		logging.info("Avg 1/FPR@0.8: %.3f", np.nanmean(list(one_over_fpr.values())))
 
 		# background rejection combined
-		if dataset not in ("top", "QG", "modelnet10"):
+		if dataset not in ("top", "QG", "modelnet10", "modelnet40"):
 				rej_vals = []
 				for i, lab in enumerate(labels[1:], start=1):
 						mask_bg = (
@@ -467,7 +472,8 @@ def parse_args():
 		p.add_argument("--data_dir", required=True)
 		p.add_argument("--save_dir", required=True)
 		p.add_argument(
-				"--dataset", choices=["hls4ml", "top", "QG", "jetclass", "modelnet10"], default="hls4ml"
+				"--dataset", choices=["hls4ml", "top", "QG", "jetclass", "modelnet10", "modelnet40"],
+		default="hls4ml"
 		)
 		p.add_argument(
 				"--sort_by",
@@ -482,7 +488,7 @@ def parse_args():
 		    help="One or more test-time orderings to evaluate. Defaults to --sort_by."
 		)
 		p.add_argument("--num_points", type=int, default=1024,
-				help="Points per cloud for --dataset modelnet10 (must match the preprocessed data)")
+				help="Points per cloud for ModelNet datasets (must match the preprocessed data)")
 		p.add_argument("--height_map", action="store_true",
 				help="ModelNet only: reorder (x,y,z)->(z,x,y) and grid on the x-y plane only, so PHAT runs its unmodified 2D jet path with z as the leading scalar channel")
 		p.add_argument("--augment", action="store_true",
@@ -552,9 +558,9 @@ def main():
 
 		# ModelNet clouds are (x, y, z) with every point real; jets are (pt, eta, phi)
 		# where the pt channel doubles as the padding indicator.
-		is_generic_cloud = args.dataset == "modelnet10"
+		is_generic_cloud = args.dataset in ("modelnet10", "modelnet40")
 		if args.height_map and not is_generic_cloud:
-				raise ValueError("--height_map is only valid for --dataset modelnet10")
+				raise ValueError("--height_map is only valid for ModelNet datasets")
 		if args.height_map:
 				# Height-map layout: [z, x, y]. Structurally identical to a jet's
 				# [pt, eta, phi] -- a 2D grid plus one leading scalar channel -- so PHAT runs
@@ -571,7 +577,7 @@ def main():
 		if is_generic_cloud and args.sort_by not in ("morton", "random"):
 				raise ValueError(
 						f'--sort_by {args.sort_by} needs a pt channel; use "morton" (recommended) '
-						'or "random" for --dataset modelnet10'
+						'or "random" for ModelNet datasets'
 				)
 
 		# pick num_particles & output_dim
@@ -580,9 +586,9 @@ def main():
 				output_dim = 10
 				loss_fn = "categorical_crossentropy"
 				feature_dim = 3
-		elif args.dataset == "modelnet10":
+		elif args.dataset in ("modelnet10", "modelnet40"):
 				num_particles = args.num_points
-				output_dim = 10
+				output_dim = 10 if args.dataset == "modelnet10" else 40
 				loss_fn = "categorical_crossentropy"
 				feature_dim = 3
 		elif args.dataset == "top":

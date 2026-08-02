@@ -29,52 +29,74 @@ from pathlib import Path
 
 import numpy as np
 
-# ModelNet10 mirrors, tried in order. The Princeton host is the canonical source but is
+# Mirrors per variant, tried in order. The Princeton hosts are canonical but are
 # frequently slow or unreachable, so keep fallbacks.
-DOWNLOAD_URLS = [
-    "https://3dshapenets.cs.princeton.edu/ModelNet10.zip",
-    "http://3dvision.princeton.edu/projects/2014/3DShapeNets/ModelNet10.zip",
-    "https://huggingface.co/datasets/Msun/modelnet10/resolve/main/ModelNet10.zip",
-]
+VARIANTS = {
+    "modelnet10": {
+        "urls": [
+            "https://3dshapenets.cs.princeton.edu/ModelNet10.zip",
+            "http://3dvision.princeton.edu/projects/2014/3DShapeNets/ModelNet10.zip",
+            "https://huggingface.co/datasets/Msun/modelnet10/resolve/main/ModelNet10.zip",
+        ],
+        "root_name": "ModelNet10",
+        "num_classes": 10,
+        "official_train": 3991,
+        "official_test": 908,
+    },
+    "modelnet40": {
+        "urls": [
+            "https://modelnet.cs.princeton.edu/ModelNet40.zip",
+            "http://modelnet.cs.princeton.edu/ModelNet40.zip",
+        ],
+        "root_name": "ModelNet40",
+        "num_classes": 40,
+        "official_train": 9843,
+        "official_test": 2468,
+    },
+}
 
-# Fixed label order; persisted to classes.json so evaluation can recover it.
-CLASS_NAMES = [
-    "bathtub",
-    "bed",
-    "chair",
-    "desk",
-    "dresser",
-    "monitor",
-    "night_stand",
-    "sofa",
-    "table",
-    "toilet",
-]
+
+def discover_class_names(root: Path):
+    """
+    Class names are the sub-directories holding train/ and test/, sorted alphabetically.
+
+    Discovered rather than hardcoded so the same code serves ModelNet10 and ModelNet40 with
+    no chance of a mistyped or misordered 40-entry list. Alphabetical order reproduces the
+    previous hardcoded ModelNet10 ordering exactly, so existing data stays compatible.
+    """
+    names = sorted(
+        d.name for d in root.iterdir()
+        if d.is_dir() and (d / "train").is_dir() and (d / "test").is_dir()
+    )
+    if not names:
+        raise RuntimeError(f"No <class>/train + <class>/test directories found under {root}")
+    return names
 
 
-def download_dataset(basedir, force_download=False):
-    """Fetch and extract ModelNet10.zip into basedir, returning the extracted root."""
+def download_dataset(basedir, variant, force_download=False):
+    """Fetch and extract the ModelNet archive into basedir, returning the extracted root."""
     import subprocess
 
     from dataset_utils import extract_archive
 
+    cfg = VARIANTS[variant]
     basedir = Path(basedir)
     basedir.mkdir(parents=True, exist_ok=True)
-    root = basedir / "ModelNet10"
-    archive = basedir / "ModelNet10.zip"
+    root = basedir / cfg["root_name"]
+    archive = basedir / f"{cfg['root_name']}.zip"
 
     if force_download and root.exists():
         logging.info("Removing existing dir %s", root)
         shutil.rmtree(root)
 
     if root.is_dir() and any(root.glob("*/train/*.off")):
-        logging.info("ModelNet10 already extracted at %s, skipping download", root)
+        logging.info("%s already extracted at %s, skipping download", cfg["root_name"], root)
         return root
 
     if force_download or not archive.exists():
         last_error = None
-        for url in DOWNLOAD_URLS:
-            logging.info("Downloading ModelNet10 from %s", url)
+        for url in cfg["urls"]:
+            logging.info("Downloading %s from %s", cfg["root_name"], url)
             try:
                 subprocess.run(
                     ["wget", "--tries=3", "--timeout=60", url, "-O", str(archive)],
@@ -87,7 +109,9 @@ def download_dataset(basedir, force_download=False):
                 if archive.exists():
                     archive.unlink()
         else:
-            raise RuntimeError(f"All ModelNet10 mirrors failed; last error: {last_error}")
+            raise RuntimeError(
+                f"All {cfg['root_name']} mirrors failed; last error: {last_error}"
+            )
     else:
         logging.info("%s already exists, skipping download", archive)
 
@@ -147,12 +171,12 @@ def sample_mesh(path: Path, num_points: int, seed: int) -> np.ndarray:
     return points.astype(np.float32)
 
 
-def build_split(root: Path, split: str, num_points: int, seed: int):
+def build_split(root: Path, split: str, num_points: int, seed: int, class_names):
     """
     Sample every mesh in <root>/<class>/<split>/. Returns (features, label_indices, names).
     """
     features, labels, names = [], [], []
-    for label_idx, class_name in enumerate(CLASS_NAMES):
+    for label_idx, class_name in enumerate(class_names):
         split_dir = root / class_name / split
         mesh_paths = sorted(split_dir.glob("*.off"))
         if not mesh_paths:
@@ -199,23 +223,26 @@ def one_hot(labels: np.ndarray, num_classes: int) -> np.ndarray:
     return np.eye(num_classes, dtype=np.float32)[labels]
 
 
-def write_split(output_dir: Path, split: str, features: np.ndarray, labels: np.ndarray):
+def write_split(output_dir: Path, split: str, features: np.ndarray, labels: np.ndarray,
+                num_classes: int):
     split_dir = output_dir / split
     split_dir.mkdir(parents=True, exist_ok=True)
     np.save(split_dir / "features.npy", features.astype(np.float32, copy=False))
-    np.save(split_dir / "labels.npy", one_hot(labels, len(CLASS_NAMES)))
+    np.save(split_dir / "labels.npy", one_hot(labels, num_classes))
     logging.info(
         "Wrote %s: features=%s labels=%s (class counts: %s)",
         split_dir,
         features.shape,
-        (len(labels), len(CLASS_NAMES)),
-        np.bincount(labels, minlength=len(CLASS_NAMES)).tolist(),
+        (len(labels), num_classes),
+        np.bincount(labels, minlength=num_classes).tolist(),
     )
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Sample ModelNet10 meshes into point-cloud .npy files")
-    p.add_argument("--input_dir", required=True, help="Directory to download/extract ModelNet10 into")
+    p = argparse.ArgumentParser(description="Sample ModelNet meshes into point-cloud .npy files")
+    p.add_argument("--variant", choices=sorted(VARIANTS), default="modelnet10",
+                   help="Which ModelNet release to process")
+    p.add_argument("--input_dir", required=True, help="Directory to download/extract the archive into")
     p.add_argument("--output_dir", required=True, help="Directory to write {train,val,test}/*.npy into")
     p.add_argument("--num_points", type=int, default=1000,
                    help="Points sampled per shape. Defaults to 1000 rather than the usual 1024 so "
@@ -235,29 +262,48 @@ def main():
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
 
+    cfg = VARIANTS[args.variant]
+
     if args.skip_download:
-        root = input_dir / "ModelNet10"
+        root = input_dir / cfg["root_name"]
         if not root.is_dir():
             root = input_dir
     else:
-        root = download_dataset(input_dir, force_download=args.force_download)
-    logging.info("Using ModelNet10 root: %s", root)
+        root = download_dataset(input_dir, args.variant, force_download=args.force_download)
+    logging.info("Using %s root: %s", cfg["root_name"], root)
 
-    train_x, train_y, _ = build_split(root, "train", args.num_points, args.seed)
-    test_x, test_y, _ = build_split(root, "test", args.num_points, args.seed)
+    class_names = discover_class_names(root)
+    logging.info("Discovered %d classes: %s", len(class_names), class_names)
+    if len(class_names) != cfg["num_classes"]:
+        raise RuntimeError(
+            f"{args.variant} expects {cfg['num_classes']} classes but found "
+            f"{len(class_names)}: {class_names}"
+        )
+
+    train_x, train_y, _ = build_split(root, "train", args.num_points, args.seed, class_names)
+    test_x, test_y, _ = build_split(root, "test", args.num_points, args.seed, class_names)
+
+    # Fail loudly if the on-disk split does not match the published dataset size, rather
+    # than silently training on a partial download.
+    if len(train_y) != cfg["official_train"] or len(test_y) != cfg["official_test"]:
+        raise RuntimeError(
+            f"{args.variant} split mismatch: got {len(train_y)} train / {len(test_y)} test, "
+            f"expected {cfg['official_train']} / {cfg['official_test']}"
+        )
 
     train_idx, val_idx = stratified_split(train_y, args.val_frac, args.seed)
     logging.info(
         "Split %d train meshes into %d train / %d val", len(train_y), len(train_idx), len(val_idx)
     )
 
+    n_cls = len(class_names)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_split(output_dir, "train", train_x[train_idx], train_y[train_idx])
-    write_split(output_dir, "val", train_x[val_idx], train_y[val_idx])
-    write_split(output_dir, "test", test_x, test_y)
+    write_split(output_dir, "train", train_x[train_idx], train_y[train_idx], n_cls)
+    write_split(output_dir, "val", train_x[val_idx], train_y[val_idx], n_cls)
+    write_split(output_dir, "test", test_x, test_y, n_cls)
 
     with open(output_dir / "classes.json", "w") as handle:
-        json.dump({name: idx for idx, name in enumerate(CLASS_NAMES)}, handle, indent=2)
+        json.dump({name: idx for idx, name in enumerate(class_names)}, handle, indent=2)
 
     logging.info("Done. num_points=%d output=%s", args.num_points, output_dir)
 

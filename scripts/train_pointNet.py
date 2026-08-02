@@ -185,11 +185,8 @@ def run_testing(model, dataset, data_dir, save_dir, sort_by, batch_size, num_par
             "label_QCD", "label_Hbb", "label_Hcc", "label_Hgg", "label_H4q",
             "label_Hqql", "label_Zqq", "label_Wqq", "label_Tbqq", "label_Tbl",
         ]
-    elif dataset == "modelnet10":
-        labels = [
-            "bathtub", "bed", "chair", "desk", "dresser",
-            "monitor", "night_stand", "sofa", "table", "toilet",
-        ]
+    elif dataset in ("modelnet10", "modelnet40"):
+        labels = [f"class_{i}" for i in range(preds.shape[1])]
     else:
         labels = [f"label_{i}" for i in range(preds.shape[1])]
 
@@ -229,7 +226,8 @@ def parse_args():
     p.add_argument("--data_dir", required=True)
     p.add_argument("--save_dir", required=True)
     p.add_argument(
-        "--dataset", choices=["hls4ml", "top", "QG", "jetclass", "modelnet10"], default="hls4ml"
+        "--dataset", choices=["hls4ml", "top", "QG", "jetclass", "modelnet10", "modelnet40"],
+        default="hls4ml"
     )
     p.add_argument(
         "--sort_by",
@@ -275,9 +273,9 @@ def main():
         num_particles = 150
         output_dim = 10
         loss_fn = "categorical_crossentropy"
-    elif args.dataset == "modelnet10":
+    elif args.dataset in ("modelnet10", "modelnet40"):
         num_particles = args.num_points
-        output_dim = 10
+        output_dim = 10 if args.dataset == "modelnet10" else 40
         loss_fn = "categorical_crossentropy"
     elif args.dataset == "top":
         num_particles = 200
